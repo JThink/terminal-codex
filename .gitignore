@@ -15,6 +15,7 @@ src-tauri/gen/
 
 # Local tooling state
 .codegraph/
+codegraph/
 .cache/
 .pnpm-store/
 .npm/
