@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="vendor/xterm.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LeviQian专属Codex</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+
+  <body>
+    <main class="app">
+      <div class="tabs-bar">
+        <div id="tabs" class="tabs">
+          <button id="new-tab" class="tab tab-add" type="button" aria-label="新建标签">
+            +
+          </button>
+        </div>
+      </div>
+      <section id="tab-panels" class="panels"></section>
+    </main>
+    <div
+      id="brand-overlay"
+      class="brand-overlay"
+      contenteditable="false"
+      spellcheck="false"
+      role="textbox"
+      aria-label="应用浮层标题"
+    ></div>
+    <script src="vendor/xterm.js"></script>
+    <script src="vendor/addon-fit.js"></script>
+    <script src="vendor/split.js"></script>
+  </body>
+</html>
