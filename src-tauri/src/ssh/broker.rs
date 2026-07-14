@@ -182,10 +182,208 @@ impl ProcessInspector for RealProcessInspector {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+struct OwnedWindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl OwnedWindowsHandle {
+    fn open_process(pid: u32) -> Result<Self, String> {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        if pid == 0 {
+            return Err("进程 ID 无效。".to_string());
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Err(windows_last_error("无法打开 Windows 进程"));
+        }
+        Ok(Self(handle))
+    }
+
+    fn process_snapshot() -> Result<Self, String> {
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPPROCESS},
+        };
+
+        let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(windows_last_error("无法创建 Windows 进程快照"));
+        }
+        Ok(Self(handle))
+    }
+
+    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedWindowsHandle {
+    fn drop(&mut self) {
+        let result = unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        debug_assert_ne!(result, 0);
+    }
+}
+
+#[cfg(windows)]
+fn windows_last_error(context: &str) -> String {
+    format!("{context}：{}", io::Error::last_os_error())
+}
+
+#[cfg(windows)]
+fn windows_process_executable(process: &OwnedWindowsHandle) -> Result<PathBuf, String> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+
+    const WINDOWS_MAX_PATH_UNITS: usize = 32_768;
+    let mut path = vec![0_u16; WINDOWS_MAX_PATH_UNITS];
+    let mut length = path.len() as u32;
+    let result =
+        unsafe { QueryFullProcessImageNameW(process.raw(), 0, path.as_mut_ptr(), &mut length) };
+    if result == 0 {
+        return Err(windows_last_error("无法读取 Windows 进程可执行文件路径"));
+    }
+    let length = usize::try_from(length)
+        .map_err(|_| "Windows 进程可执行文件路径长度超出支持范围。".to_string())?;
+    if length == 0 || length >= path.len() || path[..length].contains(&0) {
+        return Err("Windows 进程可执行文件路径返回了无效长度。".to_string());
+    }
+    path.truncate(length);
+    fs::canonicalize(PathBuf::from(OsString::from_wide(&path)))
+        .map_err(|error| format!("无法规范化 Windows 进程可执行文件路径：{error}"))
+}
+
+#[cfg(windows)]
+fn windows_process_start_time(process: &OwnedWindowsHandle) -> Result<u64, String> {
+    use windows_sys::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+
+    let mut creation_time = FILETIME::default();
+    let mut exit_time = FILETIME::default();
+    let mut kernel_time = FILETIME::default();
+    let mut user_time = FILETIME::default();
+    let result = unsafe {
+        GetProcessTimes(
+            process.raw(),
+            &mut creation_time,
+            &mut exit_time,
+            &mut kernel_time,
+            &mut user_time,
+        )
+    };
+    if result == 0 {
+        return Err(windows_last_error("无法读取 Windows 进程启动时间"));
+    }
+    let start_time =
+        (u64::from(creation_time.dwHighDateTime) << 32) | u64::from(creation_time.dwLowDateTime);
+    if start_time == 0 {
+        return Err("Windows 进程启动时间无效。".to_string());
+    }
+    Ok(start_time)
+}
+
+#[cfg(windows)]
+fn windows_process_parent_pid(pid: u32) -> Result<u32, String> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_NO_MORE_FILES,
+        System::Diagnostics::ToolHelp::{Process32FirstW, Process32NextW, PROCESSENTRY32W},
+    };
+
+    let snapshot = OwnedWindowsHandle::process_snapshot()?;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..PROCESSENTRY32W::default()
+    };
+    let mut result = unsafe { Process32FirstW(snapshot.raw(), &mut entry) };
+    loop {
+        if result == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                return Err(format!("Windows 进程快照中未找到进程 {pid}。"));
+            }
+            return Err(format!("无法遍历 Windows 进程快照：{error}"));
+        }
+        if entry.th32ProcessID == pid {
+            return Ok(entry.th32ParentProcessID);
+        }
+        result = unsafe { Process32NextW(snapshot.raw(), &mut entry) };
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_code_identity(executable: &Path) -> Result<CodeIdentity, String> {
+    use std::{
+        mem::MaybeUninit,
+        os::windows::{ffi::OsStrExt, fs::MetadataExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let file = fs::File::open(executable)
+        .map_err(|error| format!("无法打开 Windows 进程可执行文件：{error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("无法读取 Windows 进程可执行文件元数据：{error}"))?;
+    let last_write_time = metadata.last_write_time();
+    let file_size = metadata.file_size();
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if result == 0 {
+        return Err(windows_last_error("无法读取 Windows 可执行文件身份"));
+    }
+    let information = unsafe { information.assume_init() };
+    let volume_serial_number = information.dwVolumeSerialNumber;
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    if volume_serial_number == 0 || file_index == 0 {
+        return Err("Windows 可执行文件缺少必要的卷或文件索引身份。".to_string());
+    }
+    if last_write_time == 0 || file_size == 0 {
+        return Err("Windows 可执行文件缺少必要的时间或大小身份。".to_string());
+    }
+
+    let path = executable.as_os_str().encode_wide().collect::<Vec<_>>();
+    let normalized_path = normalize_windows_path_for_identity(&path);
+    let code_identity = file_identity_digest(
+        &normalized_path,
+        volume_serial_number,
+        file_index,
+        last_write_time,
+        file_size,
+    );
+    if code_identity.iter().all(|byte| *byte == 0) {
+        return Err("Windows 可执行文件代码身份无效。".to_string());
+    }
+    Ok(code_identity)
+}
+
+#[cfg(windows)]
+impl ProcessInspector for RealProcessInspector {
+    fn process_facts(&self, pid: u32) -> Result<ProcessFacts, String> {
+        let process = OwnedWindowsHandle::open_process(pid)?;
+        let executable = windows_process_executable(&process)?;
+        let start_time = windows_process_start_time(&process)?;
+        let parent_pid = windows_process_parent_pid(pid)?;
+        let code_identity = windows_file_code_identity(&executable)?;
+
+        Ok(ProcessFacts {
+            executable,
+            parent_pid,
+            start_time,
+            code_identity,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 impl ProcessInspector for RealProcessInspector {
     fn process_facts(&self, _pid: u32) -> Result<ProcessFacts, String> {
-        Err("当前平台不支持 macOS ASKPASS 进程身份校验。".to_string())
+        Err("当前平台不支持 ASKPASS 进程身份校验。".to_string())
     }
 }
 
@@ -203,14 +401,36 @@ struct ProcessIdentityVerifier {
     ssh_executable: PathBuf,
 }
 
+#[cfg(windows)]
+fn executable_paths_match(left: &Path, right: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+    let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+    normalize_windows_path_for_identity(&left) == normalize_windows_path_for_identity(&right)
+}
+
+#[cfg(not(windows))]
+fn executable_paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+fn process_facts_match(left: &ProcessFacts, right: &ProcessFacts) -> bool {
+    executable_paths_match(&left.executable, &right.executable)
+        && left.parent_pid == right.parent_pid
+        && left.start_time == right.start_time
+        && left.code_identity == right.code_identity
+}
+
 impl ProcessIdentityVerifier {
-    fn new(
+    fn new_with_ssh_executable(
         inspector: Arc<dyn ProcessInspector>,
         app_pid: u32,
         expected_app_executable: PathBuf,
+        ssh_executable: PathBuf,
     ) -> Result<Self, String> {
         let facts = inspector.process_facts(app_pid)?;
-        if facts.executable != expected_app_executable {
+        if !executable_paths_match(&facts.executable, &expected_app_executable) {
             return Err("ASKPASS broker 主应用可执行文件身份不匹配。".to_string());
         }
         Ok(Self {
@@ -221,28 +441,43 @@ impl ProcessIdentityVerifier {
                 start_time: facts.start_time,
                 code_identity: facts.code_identity,
             },
-            ssh_executable: PathBuf::from("/usr/bin/ssh"),
+            ssh_executable,
         })
+    }
+
+    #[cfg(test)]
+    fn new(
+        inspector: Arc<dyn ProcessInspector>,
+        app_pid: u32,
+        expected_app_executable: PathBuf,
+    ) -> Result<Self, String> {
+        Self::new_with_ssh_executable(
+            inspector,
+            app_pid,
+            expected_app_executable,
+            PathBuf::from("/usr/bin/ssh"),
+        )
     }
 
     fn production() -> Result<Self, String> {
         let executable = std::env::current_exe()
             .map_err(|error| format!("无法获取主应用可执行文件路径：{error}"))?;
         let executable = fs::canonicalize(executable)
-            .map_err(|_| "无法规范化主应用可执行文件路径。".to_string())?;
-        let mut verifier = Self::new(
+            .map_err(|error| format!("无法规范化主应用可执行文件路径：{error}"))?;
+        let ssh_executable = crate::platform::resolve_ssh_executable()?;
+        let ssh_executable = fs::canonicalize(ssh_executable)
+            .map_err(|error| format!("无法规范化系统 SSH 可执行文件路径：{error}"))?;
+        Self::new_with_ssh_executable(
             Arc::new(RealProcessInspector),
             std::process::id(),
             executable,
-        )?;
-        verifier.ssh_executable = fs::canonicalize("/usr/bin/ssh")
-            .map_err(|_| "无法规范化系统 SSH 可执行文件路径。".to_string())?;
-        Ok(verifier)
+            ssh_executable,
+        )
     }
 
     fn inspect_app(&self) -> Result<ProcessIdentitySnapshot, String> {
         let facts = self.inspector.process_facts(self.app.pid)?;
-        if facts.executable != self.app.executable
+        if !executable_paths_match(&facts.executable, &self.app.executable)
             || facts.start_time != self.app.start_time
             || facts.code_identity != self.app.code_identity
         {
@@ -256,7 +491,9 @@ impl ProcessIdentityVerifier {
 
     fn inspect_ssh(&self, ssh_pid: u32) -> Result<ProcessFacts, String> {
         let facts = self.inspector.process_facts(ssh_pid)?;
-        if facts.executable != self.ssh_executable || facts.parent_pid != self.app.pid {
+        if !executable_paths_match(&facts.executable, &self.ssh_executable)
+            || facts.parent_pid != self.app.pid
+        {
             return Err("ASKPASS SSH 进程路径或父进程不匹配。".to_string());
         }
         Ok(facts)
@@ -280,7 +517,7 @@ impl IdentityVerifier for ProcessIdentityVerifier {
     fn capture_peer(&self, helper_pid: u32) -> Result<PeerIdentitySnapshot, String> {
         let app = self.inspect_app()?;
         let helper_facts = self.inspector.process_facts(helper_pid)?;
-        if helper_facts.executable != self.app.executable
+        if !executable_paths_match(&helper_facts.executable, &self.app.executable)
             || helper_facts.code_identity != self.app.code_identity
         {
             return Err("ASKPASS helper 可执行文件路径不匹配。".to_string());
@@ -318,19 +555,19 @@ impl IdentityVerifier for ProcessIdentityVerifier {
             return Err("ASKPASS peer 与 SSH 进程绑定不匹配。".to_string());
         }
         let app = self.inspect_app()?;
-        if app != peer.app {
+        if app.pid != peer.app.pid || !process_facts_match(&app.facts, &peer.app.facts) {
             return Err("ASKPASS 主应用进程身份快照已变化。".to_string());
         }
         let helper = self.inspector.process_facts(peer.helper.pid)?;
-        if helper != peer.helper.facts
-            || helper.executable != self.app.executable
+        if !process_facts_match(&helper, &peer.helper.facts)
+            || !executable_paths_match(&helper.executable, &self.app.executable)
             || helper.code_identity != self.app.code_identity
             || helper.parent_pid != peer.ssh.pid
         {
             return Err("ASKPASS helper 进程身份快照已变化。".to_string());
         }
         let ssh = self.inspect_ssh(peer.ssh.pid)?;
-        if ssh != peer.ssh.facts {
+        if !process_facts_match(&ssh, &peer.ssh.facts) {
             return Err("ASKPASS SSH 进程身份快照已变化。".to_string());
         }
         Ok(())
@@ -670,6 +907,84 @@ fn token_digest(token: &str) -> TokenDigest {
     Sha256::digest(token.as_bytes()).into()
 }
 
+#[cfg(any(windows, test))]
+fn windows_ascii_lowercase(unit: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+        unit + 32
+    } else {
+        unit
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_windows_path_for_identity(path: &[u16]) -> Vec<u16> {
+    const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC_PREFIX: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    let (prefix, path) = if path
+        .get(..VERBATIM_UNC_PREFIX.len())
+        .is_some_and(|candidate| {
+            candidate
+                .iter()
+                .zip(VERBATIM_UNC_PREFIX)
+                .all(|(left, right)| {
+                    windows_ascii_lowercase(*left) == windows_ascii_lowercase(*right)
+                })
+        }) {
+        (
+            &[b'\\' as u16, b'\\' as u16][..],
+            &path[VERBATIM_UNC_PREFIX.len()..],
+        )
+    } else if path.starts_with(VERBATIM_PREFIX) {
+        (&[][..], &path[VERBATIM_PREFIX.len()..])
+    } else {
+        (&[][..], path)
+    };
+
+    prefix
+        .iter()
+        .chain(path)
+        .map(|unit| match *unit {
+            unit if unit == b'/' as u16 => b'\\' as u16,
+            unit => windows_ascii_lowercase(unit),
+        })
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn file_identity_digest(
+    normalized_path: &[u16],
+    volume_serial_number: u32,
+    file_index: u64,
+    last_write_time: u64,
+    file_size: u64,
+) -> CodeIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"terminal-codex/windows-file-identity/v1\0");
+    hasher.update((normalized_path.len() as u64).to_le_bytes());
+    for unit in normalized_path {
+        hasher.update(unit.to_le_bytes());
+    }
+    hasher.update(volume_serial_number.to_le_bytes());
+    hasher.update(file_index.to_le_bytes());
+    hasher.update(last_write_time.to_le_bytes());
+    hasher.update(file_size.to_le_bytes());
+
+    let digest = hasher.finalize();
+    let mut identity = [0_u8; 20];
+    identity.copy_from_slice(&digest[..20]);
+    identity
+}
+
 fn cancel(inner: &RegistryInner, digest: TokenDigest) {
     let mut state = inner
         .state
@@ -885,7 +1200,7 @@ impl ConnectionAcceptor for LocalListener {
 }
 
 impl AskpassBroker {
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "macos", windows)))]
     pub(crate) fn start() -> Result<Self, String> {
         Self::start_with_failure_callback(|_| {})
     }
@@ -1802,6 +2117,69 @@ mod tests {
         env.capability_token().to_string()
     }
 
+    fn digest_fixture(normalized_path: &[u16]) -> [u8; 20] {
+        super::file_identity_digest(normalized_path, 0x1234_abcd, 0x5678, 0x9abc, 0xdef0)
+    }
+
+    #[test]
+    fn file_identity_digest_is_stable_for_same_input() {
+        let path = r"c:\program files\openssh\ssh.exe"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+
+        assert_eq!(digest_fixture(&path), digest_fixture(&path));
+    }
+
+    #[test]
+    fn file_identity_digest_changes_for_each_file_identity_field() {
+        let path = r"c:\program files\openssh\ssh.exe"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let original = digest_fixture(&path);
+        let other_path = r"c:\windows\system32\openssh\ssh.exe"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+
+        assert_ne!(
+            original,
+            super::file_identity_digest(&other_path, 0x1234_abcd, 0x5678, 0x9abc, 0xdef0)
+        );
+        assert_ne!(
+            original,
+            super::file_identity_digest(&path, 0x1234_abce, 0x5678, 0x9abc, 0xdef0)
+        );
+        assert_ne!(
+            original,
+            super::file_identity_digest(&path, 0x1234_abcd, 0x5679, 0x9abc, 0xdef0)
+        );
+        assert_ne!(
+            original,
+            super::file_identity_digest(&path, 0x1234_abcd, 0x5678, 0x9abd, 0xdef0)
+        );
+        assert_ne!(
+            original,
+            super::file_identity_digest(&path, 0x1234_abcd, 0x5678, 0x9abc, 0xdef1)
+        );
+    }
+
+    #[test]
+    fn file_identity_digest_is_stable_after_windows_path_normalization() {
+        let verbatim_upper = r"\\?\C:\Program Files\OpenSSH\SSH.EXE"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let regular_lower = r"c:/program files/openssh/ssh.exe"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let normalized_upper = super::normalize_windows_path_for_identity(&verbatim_upper);
+        let normalized_lower = super::normalize_windows_path_for_identity(&regular_lower);
+
+        assert_eq!(normalized_upper, normalized_lower);
+        assert_eq!(
+            digest_fixture(&normalized_upper),
+            digest_fixture(&normalized_lower)
+        );
+    }
+
     #[test]
     fn exact_identity_consumes_registered_snapshot_once() {
         let clock = Arc::new(FakeClock::new());
@@ -1919,6 +2297,27 @@ mod tests {
             .unwrap();
 
         assert!(facts.code_identity.iter().any(|byte| *byte != 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_process_inspector_returns_current_windows_process_identity() {
+        let current_executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+
+        let facts = super::RealProcessInspector
+            .process_facts(std::process::id())
+            .unwrap();
+
+        assert_eq!(facts.executable, current_executable);
+        assert_ne!(facts.parent_pid, 0);
+        assert_ne!(facts.start_time, 0);
+        assert!(facts.code_identity.iter().any(|byte| *byte != 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_process_inspector_rejects_zero_pid_on_windows() {
+        assert!(super::RealProcessInspector.process_facts(0).is_err());
     }
 
     #[test]
@@ -2740,9 +3139,16 @@ mod tests {
         assert!(crate::ssh::askpass::request_password(broker.socket_path(), &token).is_err());
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn production_broker_starts_with_current_app_identity() {
+        let ssh_executable = crate::platform::resolve_ssh_executable()
+            .expect("测试环境必须提供可用的 OpenSSH 客户端");
+        assert!(
+            ssh_executable.is_file(),
+            "测试环境解析出的 OpenSSH 路径必须是文件"
+        );
+
         let broker = AskpassBroker::start().unwrap();
 
         assert!(broker.socket_path().exists());
