@@ -65,22 +65,24 @@ impl SshRecoveryState {
         blockers.broker = Some(error);
     }
 
-    pub(crate) fn blocked_error(&self) -> Option<String> {
+    pub(crate) fn ensure_ready(&self) -> Result<(), String> {
         let blockers = self
             .blockers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match (&blockers.recovery, &blockers.broker) {
-            (Some(recovery), Some(broker)) => Some(format!("{recovery}；{broker}")),
-            (Some(recovery), None) => Some(recovery.clone()),
-            (None, Some(broker)) => Some(broker.clone()),
-            (None, None) => None,
+        match &blockers.recovery {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
         }
     }
 
-    pub(crate) fn ensure_ready(&self) -> Result<(), String> {
-        match self.blocked_error() {
-            Some(error) => Err(error),
+    pub(crate) fn ensure_broker_ready(&self) -> Result<(), String> {
+        let blockers = self
+            .blockers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &blockers.broker {
+            Some(error) => Err(error.clone()),
             None => Ok(()),
         }
     }
@@ -1370,6 +1372,7 @@ fn prepare_ssh_process(
     let profile = find_ssh_profile(profiles_path, profile_id)?;
     let (profile, pending_ticket, askpass_env) = if profile.auth_type == ssh::SshAuthType::Password
     {
+        state.ssh_recovery.ensure_broker_ready()?;
         let snapshot =
             ssh::credential_snapshot_for_launch(profiles_path, &credentials, profile_id)?;
         let profile = snapshot.profile.clone();

@@ -2275,7 +2275,7 @@ mod journal_tests {
 
         let error = state.ensure_ready().unwrap_err();
         assert!(error.starts_with("应用启动时无法恢复 SSH 凭据事务："));
-        assert_eq!(state.blocked_error().as_deref(), Some(error.as_str()));
+        assert!(state.ensure_broker_ready().is_ok());
         assert!(credential_journal_path(&path).exists());
     }
 
@@ -2311,7 +2311,7 @@ mod journal_tests {
         state.retry(&dir.0, &store).unwrap();
 
         assert!(state.ensure_ready().is_ok());
-        assert_eq!(state.blocked_error(), None);
+        assert!(state.ensure_broker_ready().is_ok());
         assert!(!credential_journal_path(&path).exists());
         assert_eq!(load_profiles(&path).unwrap()[0].name, "Retry target");
     }

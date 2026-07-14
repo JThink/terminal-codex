@@ -2735,15 +2735,17 @@ mod tests {
         assert_eq!(registry.entry_count(), 0);
         assert!(registry.register(snapshot()).is_err());
         assert!(health.ensure_healthy().is_err());
+        assert!(state.ssh_recovery.ensure_ready().is_ok());
         assert!(state
             .ssh_recovery
-            .ensure_ready()
+            .ensure_broker_ready()
             .unwrap_err()
             .contains("fatal"));
         state.ssh_recovery.retry(&directory, &credentials).unwrap();
+        assert!(state.ssh_recovery.ensure_ready().is_ok());
         assert!(state
             .ssh_recovery
-            .ensure_ready()
+            .ensure_broker_ready()
             .unwrap_err()
             .contains("fatal"));
         assert!(state.sessions.lock().unwrap().is_empty());
@@ -2781,9 +2783,10 @@ mod tests {
             },
         );
 
+        assert!(state.ssh_recovery.ensure_ready().is_ok());
         assert!(state
             .ssh_recovery
-            .ensure_ready()
+            .ensure_broker_ready()
             .unwrap_err()
             .contains("runtime-start-race"));
         drop(state);
@@ -3098,7 +3101,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_start_failure_blocks_only_ssh_and_survives_recovery_retry() {
+    fn broker_start_failure_does_not_block_profile_or_non_password_operations() {
         let directory = std::env::temp_dir().join(format!(
             "lc-startup-{}-{}",
             std::process::id(),
@@ -3118,15 +3121,17 @@ mod tests {
 
         assert!(state.sessions.lock().unwrap().is_empty());
         assert!(state.ssh_broker.lock().unwrap().is_none());
+        assert!(state.ssh_recovery.ensure_ready().is_ok());
         assert!(state
             .ssh_recovery
-            .ensure_ready()
+            .ensure_broker_ready()
             .unwrap_err()
             .contains("broker"));
         state.ssh_recovery.retry(&directory, &credentials).unwrap();
+        assert!(state.ssh_recovery.ensure_ready().is_ok());
         assert!(state
             .ssh_recovery
-            .ensure_ready()
+            .ensure_broker_ready()
             .unwrap_err()
             .contains("broker"));
         std::fs::remove_dir_all(directory).unwrap();
