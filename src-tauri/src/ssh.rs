@@ -15,7 +15,7 @@ pub(crate) use askpass::ssh_askpass_exit_code_if_requested;
 pub(crate) use broker::{AskpassBroker, BoundAskpassTicket, PendingAskpassTicket};
 pub(crate) use credentials::{
     credential_snapshot_for_launch, delete_profile_with_credential, upsert_profile_with_credential,
-    CredentialStore, CredentialUpdate, KeychainCredentialStore,
+    CredentialStore, CredentialUpdate, LocalVaultCredentialStore,
 };
 #[cfg(test)]
 use credentials::{delete_profile_transaction, upsert_profile_transaction, ProfileRepository};
@@ -374,7 +374,7 @@ mod tests {
         cleanup_temporary_file_after_save_error, delete_profile_transaction, generate_profile_id,
         load_profiles, sanitize_ssh_error, save_profiles, upsert_profile_transaction,
         validate_profile, validate_profile_for_connection, CredentialStore, CredentialUpdate,
-        KeychainCredentialStore, ProfileRepository, SshAuthType, SshProfile, SSH_ERROR_LIMIT_CHARS,
+        ProfileRepository, SshAuthType, SshProfile, SSH_ERROR_LIMIT_CHARS,
     };
     use std::{
         cell::{Cell, RefCell},
@@ -812,72 +812,6 @@ mod tests {
         )
         .unwrap_err()
         .starts_with("私钥文件不存在或不是普通文件："));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_keychain_store_round_trips_updates_and_deletes_in_isolated_service() {
-        struct CleanupGuard<'a> {
-            store: &'a KeychainCredentialStore,
-            account: String,
-        }
-
-        impl Drop for CleanupGuard<'_> {
-            fn drop(&mut self) {
-                let _ = self.store.delete(&self.account);
-            }
-        }
-
-        let service = "com.levi.codex-terminal.ssh.test".to_string();
-        let account = format!("credential-record-round-trip-{}", uuid::Uuid::new_v4());
-        let store = KeychainCredentialStore::new_for_service(service.clone());
-        let guard = CleanupGuard {
-            store: &store,
-            account: account.clone(),
-        };
-        let endpoint = endpoint_fingerprint("keychain-test.invalid", 2222, "integration-test");
-        let first_revision = uuid::Uuid::new_v4();
-        let first = CredentialRecord::new(
-            first_revision,
-            endpoint,
-            Zeroizing::new(b"first-keychain-test-password".to_vec()),
-        )
-        .unwrap();
-        let second_revision = uuid::Uuid::new_v4();
-        let second = CredentialRecord::new(
-            second_revision,
-            endpoint,
-            Zeroizing::new(b"second-keychain-test-password".to_vec()),
-        )
-        .unwrap();
-
-        store.delete(&account).unwrap();
-        assert!(store.get(&account).unwrap().is_none());
-        let first_encoded = first.encode();
-        store.set(&account, &first_encoded).unwrap();
-        let predictable_account_value =
-            security_framework::passwords::get_generic_password(&service, &account).unwrap();
-        assert_ne!(predictable_account_value, first_encoded.as_slice());
-        assert!(!predictable_account_value
-            .windows(b"first-keychain-test-password".len())
-            .any(|window| window == b"first-keychain-test-password"));
-        let stored = store.get(&account).unwrap().unwrap();
-        let decoded = CredentialRecord::decode(&stored).unwrap();
-        assert_eq!(decoded.revision(), first_revision);
-        assert_eq!(decoded.endpoint(), endpoint);
-        assert_eq!(decoded.password(), b"first-keychain-test-password");
-
-        store.set(&account, &second.encode()).unwrap();
-        let stored = store.get(&account).unwrap().unwrap();
-        let decoded = CredentialRecord::decode(&stored).unwrap();
-        assert_eq!(decoded.revision(), second_revision);
-        assert_eq!(decoded.endpoint(), endpoint);
-        assert_eq!(decoded.password(), b"second-keychain-test-password");
-
-        store.delete(&account).unwrap();
-        assert!(store.get(&account).unwrap().is_none());
-        drop(guard);
-        assert!(store.get(&account).unwrap().is_none());
     }
 
     fn write_test_key(dir: &Path) -> PathBuf {

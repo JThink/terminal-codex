@@ -1,10 +1,16 @@
 use super::SshProfile;
 #[cfg(test)]
 use super::{generate_profile_id, validate_profile, validate_profile_for_connection, SshAuthType};
-use serde::Deserialize;
+use aes_gcm::{
+    aead::{Aead, Payload},
+    Aes256Gcm, KeyInit, Nonce,
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
@@ -15,19 +21,13 @@ use fs2::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-const SSH_KEYCHAIN_SERVICE: &str = "com.levi.codex-terminal.ssh";
 const CREDENTIAL_RECORD_MAGIC: &[u8; 8] = b"LCSSHCR\0";
 const CREDENTIAL_RECORD_VERSION: u8 = 1;
 const CREDENTIAL_RECORD_HEADER_LEN: usize = 8 + 1 + 16 + 32 + 4;
-#[cfg(target_os = "macos")]
-const CREDENTIAL_POINTER_MAGIC: &[u8; 8] = b"LCSSHPTR";
-#[cfg(target_os = "macos")]
-const CREDENTIAL_POINTER_VERSION: u8 = 1;
-#[cfg(target_os = "macos")]
-const CREDENTIAL_POINTER_LEN: usize = 8 + 1 + 16;
+const LOCAL_VAULT_KEY_LEN: usize = 32;
+const LOCAL_VAULT_NONCE_LEN: usize = 12;
+const LOCAL_VAULT_VERSION: u32 = 1;
 static PROCESS_CREDENTIAL_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(target_os = "macos")]
-const ERR_SEC_ITEM_NOT_FOUND: i32 = -25_300;
 
 pub(crate) fn credential_lock_path(path: &Path) -> PathBuf {
     path.parent()
@@ -186,171 +186,255 @@ pub(crate) trait CredentialStore {
     fn delete(&self, account: &str) -> Result<(), String>;
 }
 
-pub(crate) struct KeychainCredentialStore {
-    service: String,
+#[derive(Clone, Debug)]
+pub(crate) struct LocalVaultCredentialStore {
+    key_path: PathBuf,
+    vault_path: PathBuf,
 }
 
-impl KeychainCredentialStore {
-    pub(crate) fn production() -> Self {
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalVaultDocument {
+    version: u32,
+    records: BTreeMap<String, LocalVaultEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalVaultEntry {
+    nonce: String,
+    ciphertext: String,
+}
+
+impl LocalVaultDocument {
+    fn new() -> Self {
         Self {
-            service: SSH_KEYCHAIN_SERVICE.to_string(),
+            version: LOCAL_VAULT_VERSION,
+            records: BTreeMap::new(),
+        }
+    }
+}
+
+impl LocalVaultCredentialStore {
+    pub(crate) fn for_app_config_dir(app_config_dir: &Path) -> Self {
+        Self {
+            key_path: app_config_dir.join("ssh-secrets.key"),
+            vault_path: app_config_dir.join("ssh-secrets.vault"),
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn new_for_service(service: String) -> Self {
-        Self { service }
+    pub(crate) fn for_profiles_path(profiles_path: &Path) -> Self {
+        let app_config_dir = profiles_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Self::for_app_config_dir(app_config_dir)
     }
-}
 
-#[cfg(target_os = "macos")]
-fn encode_credential_pointer(revision: uuid::Uuid) -> [u8; CREDENTIAL_POINTER_LEN] {
-    let mut pointer = [0_u8; CREDENTIAL_POINTER_LEN];
-    pointer[..CREDENTIAL_POINTER_MAGIC.len()].copy_from_slice(CREDENTIAL_POINTER_MAGIC);
-    pointer[CREDENTIAL_POINTER_MAGIC.len()] = CREDENTIAL_POINTER_VERSION;
-    pointer[CREDENTIAL_POINTER_MAGIC.len() + 1..].copy_from_slice(revision.as_bytes());
-    pointer
-}
-
-#[cfg(target_os = "macos")]
-fn decode_credential_pointer(value: &[u8]) -> Option<uuid::Uuid> {
-    if value.len() != CREDENTIAL_POINTER_LEN
-        || &value[..CREDENTIAL_POINTER_MAGIC.len()] != CREDENTIAL_POINTER_MAGIC
-        || value[CREDENTIAL_POINTER_MAGIC.len()] != CREDENTIAL_POINTER_VERSION
-    {
-        return None;
-    }
-    uuid::Uuid::from_slice(&value[CREDENTIAL_POINTER_MAGIC.len() + 1..]).ok()
-}
-
-#[cfg(target_os = "macos")]
-fn revision_credential_account(profile_id: &str, revision: uuid::Uuid) -> String {
-    format!("{profile_id}:{revision}")
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_get(service: &str, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
-    match security_framework::passwords::get_generic_password(service, account) {
-        Ok(value) => Ok(Some(Zeroizing::new(value))),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
-        Err(error) => Err(format!(
-            "无法从 macOS Keychain 读取 SSH 密码（状态码 {}）。",
-            error.code()
-        )),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_delete(service: &str, account: &str) -> Result<(), String> {
-    match security_framework::passwords::delete_generic_password(service, account) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
-        Err(error) => Err(format!(
-            "无法从 macOS Keychain 删除 SSH 密码（状态码 {}）。",
-            error.code()
-        )),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_add_only(service: &str, account: &str, value: &[u8]) -> Result<(), String> {
-    use security_framework::os::macos::keychain::SecKeychain;
-
-    let keychain = SecKeychain::default()
-        .map_err(|error| format!("无法打开默认 macOS Keychain（状态码 {}）。", error.code()))?;
-    keychain
-        .add_generic_password(service, account, value)
-        .map_err(|error| {
+    fn load_key(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        let key = fs::read(&self.key_path).map_err(|error| {
             format!(
-                "无法向 macOS Keychain 新增 SSH 密码（状态码 {}）。",
-                error.code()
+                "无法读取 SSH 本地凭据密钥 {}：{error}",
+                self.key_path.display()
             )
-        })
+        })?;
+        if key.len() != LOCAL_VAULT_KEY_LEN {
+            return Err("SSH 本地凭据密钥长度无效。".to_string());
+        }
+        Ok(Zeroizing::new(key))
+    }
+
+    fn load_or_create_key(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        match self.load_key() {
+            Ok(key) => Ok(key),
+            Err(_) if !self.key_path.exists() => {
+                let mut key = Zeroizing::new(vec![0_u8; LOCAL_VAULT_KEY_LEN]);
+                getrandom::getrandom(&mut key)
+                    .map_err(|error| format!("无法生成 SSH 本地凭据密钥：{error}"))?;
+                write_secret_file(&self.key_path, &key)?;
+                Ok(key)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn load_vault(&self) -> Result<LocalVaultDocument, String> {
+        match fs::read(&self.vault_path) {
+            Ok(bytes) => {
+                let document: LocalVaultDocument =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        format!(
+                            "SSH 本地凭据库格式无效 {}：{error}",
+                            self.vault_path.display()
+                        )
+                    })?;
+                if document.version != LOCAL_VAULT_VERSION {
+                    return Err("SSH 本地凭据库版本不受支持。".to_string());
+                }
+                Ok(document)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(LocalVaultDocument::new())
+            }
+            Err(error) => Err(format!(
+                "无法读取 SSH 本地凭据库 {}：{error}",
+                self.vault_path.display()
+            )),
+        }
+    }
+
+    fn save_vault(&self, document: &LocalVaultDocument) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(document)
+            .map_err(|error| format!("无法序列化 SSH 本地凭据库：{error}"))?;
+        write_secret_file(&self.vault_path, &bytes)
+    }
 }
 
-#[cfg(target_os = "macos")]
-impl CredentialStore for KeychainCredentialStore {
+impl CredentialStore for LocalVaultCredentialStore {
     fn get(&self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
-        let value = keychain_get(&self.service, account)?;
-        let Some(value) = value else {
+        if !self.vault_path.exists() {
+            return Ok(None);
+        }
+        let vault = self.load_vault()?;
+        let Some(entry) = vault.records.get(account) else {
             return Ok(None);
         };
-        let Some(revision) = decode_credential_pointer(&value) else {
-            return Ok(Some(value));
-        };
-        let revision_account = revision_credential_account(account, revision);
-        match keychain_get(&self.service, &revision_account)? {
-            Some(record) => Ok(Some(record)),
-            None => Err("macOS Keychain SSH 密码指针对应的凭据不存在。".to_string()),
-        }
+        let key = self.load_key()?;
+        let nonce = hex_decode_exact(&entry.nonce, LOCAL_VAULT_NONCE_LEN)?;
+        let ciphertext = hex_decode(&entry.ciphertext)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&key).map_err(|_| "SSH 本地凭据密钥无效。".to_string())?;
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: account.as_bytes(),
+                },
+            )
+            .map(|value| Some(Zeroizing::new(value)))
+            .map_err(|_| "无法解密 SSH 本地凭据。".to_string())
     }
 
     fn set(&self, account: &str, password: &[u8]) -> Result<(), String> {
-        let record = CredentialRecord::decode(password)
-            .map_err(|_| "拒绝向 macOS Keychain 保存格式无效的 SSH 密码凭据。".to_string())?;
-        let revision = record.revision();
-        let revision_account = revision_credential_account(account, revision);
-        let previous_pointer = keychain_get(&self.service, account)?;
-        let previous_revision = previous_pointer
-            .as_deref()
-            .and_then(|value| decode_credential_pointer(value));
-
-        let added = match keychain_get(&self.service, &revision_account)? {
-            Some(existing) if existing.as_slice() == password => false,
-            Some(_) => {
-                return Err("macOS Keychain SSH 密码 revision account 已被占用。".to_string())
-            }
-            None => {
-                keychain_add_only(&self.service, &revision_account, password)?;
-                true
-            }
-        };
-
-        let pointer = encode_credential_pointer(revision);
-        if let Err(error) =
-            security_framework::passwords::set_generic_password(&self.service, account, &pointer)
-        {
-            if added {
-                let _ = keychain_delete(&self.service, &revision_account);
-            }
-            return Err(format!(
-                "无法向 macOS Keychain 保存 SSH 密码指针（状态码 {}）。",
-                error.code()
-            ));
-        }
-
-        if let Some(previous_revision) = previous_revision.filter(|value| *value != revision) {
-            let previous_account = revision_credential_account(account, previous_revision);
-            let _ = keychain_delete(&self.service, &previous_account);
-        }
-        Ok(())
+        CredentialRecord::decode(password)
+            .map_err(|_| "拒绝保存格式无效的 SSH 密码凭据。".to_string())?;
+        let key = self.load_or_create_key()?;
+        let mut nonce = [0_u8; LOCAL_VAULT_NONCE_LEN];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|error| format!("无法生成 SSH 本地凭据 nonce：{error}"))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&key).map_err(|_| "SSH 本地凭据密钥无效。".to_string())?;
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: password,
+                    aad: account.as_bytes(),
+                },
+            )
+            .map_err(|_| "无法加密 SSH 本地凭据。".to_string())?;
+        let mut vault = self.load_vault()?;
+        vault.records.insert(
+            account.to_string(),
+            LocalVaultEntry {
+                nonce: hex_encode(&nonce),
+                ciphertext: hex_encode(&ciphertext),
+            },
+        );
+        self.save_vault(&vault)
     }
 
     fn delete(&self, account: &str) -> Result<(), String> {
-        let revision = keychain_get(&self.service, account)?
-            .as_deref()
-            .and_then(|value| decode_credential_pointer(value));
-        keychain_delete(&self.service, account)?;
-        if let Some(revision) = revision {
-            let revision_account = revision_credential_account(account, revision);
-            keychain_delete(&self.service, &revision_account)?;
+        if !self.vault_path.exists() {
+            return Ok(());
+        }
+        let mut vault = self.load_vault()?;
+        if vault.records.remove(account).is_some() {
+            self.save_vault(&vault)?;
         }
         Ok(())
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-impl CredentialStore for KeychainCredentialStore {
-    fn get(&self, _account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
-        Err("当前平台不支持 macOS Keychain。".to_string())
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建 SSH 本地凭据目录 {}：{error}", parent.display()))?;
     }
-
-    fn set(&self, _account: &str, _password: &[u8]) -> Result<(), String> {
-        Err("当前平台不支持 macOS Keychain。".to_string())
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("ssh-secret"),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).map_err(|error| {
+        format!(
+            "无法创建 SSH 本地凭据临时文件 {}：{error}",
+            temporary.display()
+        )
+    })?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "无法写入 SSH 本地凭据临时文件 {}：{error}",
+            temporary.display()
+        ));
     }
+    drop(file);
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("无法替换 SSH 本地凭据文件 {}：{error}", path.display())
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| format!("无法设置 SSH 本地凭据文件权限 {}：{error}", path.display()))?;
+    Ok(())
+}
 
-    fn delete(&self, _account: &str) -> Result<(), String> {
-        Err("当前平台不支持 macOS Keychain。".to_string())
+fn hex_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(TABLE[(byte >> 4) as usize] as char);
+        encoded.push(TABLE[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode_exact(value: &str, len: usize) -> Result<Vec<u8>, String> {
+    let decoded = hex_decode(value)?;
+    if decoded.len() != len {
+        return Err("SSH 本地凭据库编码长度无效。".to_string());
+    }
+    Ok(decoded)
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() % 2 != 0 {
+        return Err("SSH 本地凭据库编码无效。".to_string());
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let raw = value.as_bytes();
+    for chunk in raw.chunks_exact(2) {
+        let high = hex_nibble(chunk[0])?;
+        let low = hex_nibble(chunk[1])?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("SSH 本地凭据库编码无效。".to_string()),
     }
 }
 
@@ -579,6 +663,86 @@ use super::transaction::{
     credential_journal_path, delete_profile_with_credential_at_crash,
     recover_credential_transaction, upsert_profile_with_credential_at_crash, TransactionCrashPoint,
 };
+
+#[cfg(test)]
+mod local_vault_tests {
+    use super::{
+        endpoint_fingerprint, CredentialRecord, CredentialStore, LocalVaultCredentialStore,
+    };
+    use std::{fs, path::PathBuf};
+    use zeroize::Zeroizing;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "terminal-codex-local-vault-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn local_vault_store_encrypts_updates_and_deletes_without_plaintext() {
+        let dir = TestDir::new();
+        let profiles_path = dir.0.join("ssh-profiles.json");
+        let store = LocalVaultCredentialStore::for_profiles_path(&profiles_path);
+        let account = "74c00a0b-a7e5-410c-9aed-7e9f5045507b";
+        let endpoint = endpoint_fingerprint("example.com", 22, "deploy");
+        let first = CredentialRecord::new(
+            uuid::Uuid::new_v4(),
+            endpoint,
+            Zeroizing::new(b"first-local-vault-password".to_vec()),
+        )
+        .unwrap();
+        let second = CredentialRecord::new(
+            uuid::Uuid::new_v4(),
+            endpoint,
+            Zeroizing::new(b"second-local-vault-password".to_vec()),
+        )
+        .unwrap();
+
+        store.set(account, &first.encode()).unwrap();
+        assert_eq!(
+            CredentialRecord::decode(&store.get(account).unwrap().unwrap())
+                .unwrap()
+                .password(),
+            b"first-local-vault-password"
+        );
+        let first_vault = fs::read(dir.0.join("ssh-secrets.vault")).unwrap();
+        assert!(!first_vault
+            .windows(b"first-local-vault-password".len())
+            .any(|window| window == b"first-local-vault-password"));
+        assert!(fs::metadata(dir.0.join("ssh-secrets.key"))
+            .unwrap()
+            .is_file());
+
+        store.set(account, &second.encode()).unwrap();
+        assert_eq!(
+            CredentialRecord::decode(&store.get(account).unwrap().unwrap())
+                .unwrap()
+                .password(),
+            b"second-local-vault-password"
+        );
+        assert!(!fs::read(dir.0.join("ssh-secrets.vault"))
+            .unwrap()
+            .windows(b"second-local-vault-password".len())
+            .any(|window| window == b"second-local-vault-password"));
+
+        store.delete(account).unwrap();
+        assert!(store.get(account).unwrap().is_none());
+    }
+}
 
 #[cfg(test)]
 mod record_tests {
@@ -1195,7 +1359,7 @@ mod locking_tests {
                 while !*released {
                     released = self.release_failed_set.1.wait(released).unwrap();
                 }
-                return Err("模拟目标 Keychain 写入失败".into());
+                return Err("模拟目标凭据写入失败".into());
             }
             Ok(())
         }
@@ -1621,7 +1785,7 @@ mod journal_tests {
     }
 
     #[test]
-    fn set_crash_points_recover_by_observed_keychain_revision() {
+    fn set_crash_points_recover_by_observed_credential_revision() {
         for point in TransactionCrashPoint::ALL {
             let dir = TestDir::new();
             let path = dir.0.join("ssh-profiles.json");
@@ -1717,7 +1881,7 @@ mod journal_tests {
     }
 
     #[test]
-    fn unknown_keychain_state_keeps_journal_and_blocks_launch_snapshot() {
+    fn unknown_credential_state_keeps_journal_and_blocks_launch_snapshot() {
         let dir = TestDir::new();
         let path = dir.0.join("ssh-profiles.json");
         let store = MemoryCredentialStore::default();

@@ -317,6 +317,16 @@ fn profile_has_saved_password_hint(profile: &ssh::SshProfile) -> bool {
             .is_some()
 }
 
+fn profile_has_saved_password(
+    profile: &ssh::SshProfile,
+    credentials: &dyn ssh::CredentialStore,
+) -> Result<bool, String> {
+    if !profile_has_saved_password_hint(profile) {
+        return Ok(false);
+    }
+    credentials.get(&profile.id).map(|value| value.is_some())
+}
+
 const CODEX_HISTORY_REFRESH_INTERVAL_MS: u128 = 1_500;
 
 fn now_epoch_ms() -> u128 {
@@ -1334,7 +1344,7 @@ fn prepare_ssh_process(
     String,
 > {
     state.ssh_recovery.ensure_ready()?;
-    let credentials = ssh::KeychainCredentialStore::production();
+    let credentials = ssh::LocalVaultCredentialStore::for_profiles_path(profiles_path);
     let profile = find_ssh_profile(profiles_path, profile_id)?;
     let (profile, pending_ticket, askpass_env) = if profile.auth_type == ssh::SshAuthType::Password
     {
@@ -1495,12 +1505,12 @@ fn list_ssh_profiles(
 ) -> Result<Vec<SshProfileView>, String> {
     state.ssh_recovery.ensure_ready()?;
     let profiles_path = ssh_profiles_path(&app)?;
-    let credentials = ssh::KeychainCredentialStore::production();
+    let credentials = ssh::LocalVaultCredentialStore::for_profiles_path(&profiles_path);
     ssh::recover_credential_transaction(&profiles_path, &credentials)?;
     ssh::load_profiles(&profiles_path)?
         .into_iter()
         .map(|profile| {
-            let has_password = profile_has_saved_password_hint(&profile);
+            let has_password = profile_has_saved_password(&profile, &credentials)?;
             Ok(SshProfileView::new(profile, has_password))
         })
         .collect()
@@ -1525,7 +1535,7 @@ fn save_ssh_profile(
     };
     let profile = ssh::upsert_profile_with_credential(
         &profiles_path,
-        &ssh::KeychainCredentialStore::production(),
+        &ssh::LocalVaultCredentialStore::for_profiles_path(&profiles_path),
         profile,
         credential_update,
     )?;
@@ -1540,9 +1550,10 @@ fn delete_ssh_profile(
     profile_id: String,
 ) -> Result<(), String> {
     state.ssh_recovery.ensure_ready()?;
+    let profiles_path = ssh_profiles_path(&app)?;
     ssh::delete_profile_with_credential(
-        &ssh_profiles_path(&app)?,
-        &ssh::KeychainCredentialStore::production(),
+        &profiles_path,
+        &ssh::LocalVaultCredentialStore::for_profiles_path(&profiles_path),
         &profile_id,
     )
 }
@@ -1784,13 +1795,17 @@ pub fn run() {
                 .path()
                 .app_config_dir()
                 .map_err(|error| format!("应用启动时无法定位配置目录：{error}"));
+            let credentials_dir = app_config_dir
+                .clone()
+                .unwrap_or_else(|_| PathBuf::from("."));
+            let credentials = ssh::LocalVaultCredentialStore::for_app_config_dir(&credentials_dir);
             let state = app.state::<AppState>();
             let broker_recovery = Arc::clone(&state.ssh_recovery);
             attempt_ssh_subsystem_startup(
                 &state.ssh_recovery,
                 &state.ssh_broker,
                 app_config_dir,
-                &ssh::KeychainCredentialStore::production(),
+                &credentials,
                 move || {
                     ssh::AskpassBroker::start_with_failure_callback(move |error| {
                         broker_recovery.record_broker_failure(format!(
@@ -1848,11 +1863,12 @@ mod task_three_tests {
         process::Command,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            mpsc, Arc,
+            mpsc, Arc, Mutex,
         },
         thread,
         time::{Duration, Instant},
     };
+    use zeroize::Zeroizing;
 
     #[test]
     fn terminal_output_serializes_raw_bytes_without_utf8_conversion() {
@@ -1986,7 +2002,7 @@ mod task_three_tests {
     }
 
     #[test]
-    fn password_hint_comes_from_profile_binding_without_keychain_reads() {
+    fn password_hint_comes_from_profile_binding_without_credential_reads() {
         let mut password = ssh::SshProfile {
             id: uuid::Uuid::new_v4().to_string(),
             name: "Password".into(),
@@ -2006,5 +2022,61 @@ mod task_three_tests {
         password.auth_type = ssh::SshAuthType::Agent;
         password.credential_revision = Some(uuid::Uuid::new_v4().to_string());
         assert!(!super::profile_has_saved_password_hint(&password));
+    }
+
+    #[derive(Default)]
+    struct MemoryCredentialStore(Mutex<HashMap<String, Vec<u8>>>);
+
+    impl ssh::CredentialStore for MemoryCredentialStore {
+        fn get(&self, account: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(account)
+                .cloned()
+                .map(Zeroizing::new))
+        }
+
+        fn set(&self, account: &str, password: &[u8]) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), password.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) -> Result<(), String> {
+            self.0.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn password_hint_requires_local_credential_record() {
+        let profile = ssh::SshProfile {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Password".into(),
+            host: "example.com".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth_type: ssh::SshAuthType::Password,
+            identity_file: None,
+            connect_timeout: 15,
+            credential_revision: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        let store = MemoryCredentialStore::default();
+
+        assert!(!super::profile_has_saved_password(&profile, &store).unwrap());
+
+        ssh::CredentialStore::set(&store, &profile.id, b"local-vault-record").unwrap();
+        assert!(super::profile_has_saved_password(&profile, &store).unwrap());
+    }
+
+    #[test]
+    fn production_ssh_password_paths_do_not_construct_keychain_store() {
+        let source = include_str!("lib.rs");
+        let forbidden = ["KeychainCredentialStore", "::production"].concat();
+        assert!(!source.contains(&forbidden));
     }
 }

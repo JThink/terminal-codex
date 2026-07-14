@@ -594,7 +594,7 @@ fn execute_plan(
         return Err(rollback_after_error(path, credentials, plan, primary));
     }
     if crash_at == Some(TransactionCrashPoint::Credential) {
-        return Err("模拟在 Keychain 提交后崩溃。".to_string());
+        return Err("模拟在凭据提交后崩溃。".to_string());
     }
 
     if let Err(error) = save_profiles(path, &plan.target_profiles) {

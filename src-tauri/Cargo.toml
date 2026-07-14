@@ -28,6 +28,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["serde"] }
 fs2 = "0.4"
 sha2 = "0.10"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7"
+aes-gcm = "0.10"
+getrandom = "0.2"
