@@ -63,6 +63,14 @@ jobs:
       - name: Test Rust backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
+      - name: Smoke test Windows ConPTY
+        if: runner.os == 'Windows'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml windows_conpty_ -- --nocapture
+
+      - name: Smoke test Windows ASKPASS transport
+        if: runner.os == 'Windows'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml local_peer_pid_reports_real_connecting_process -- --nocapture
+
       - name: Lint Rust backend
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 

@@ -1409,6 +1409,11 @@ fn pty_command_from_ssh_spec(spec: &ssh::SshProcessSpec) -> CommandBuilder {
     command
 }
 
+#[cfg(windows)]
+fn ssh_test_creation_flags() -> u32 {
+    windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+}
+
 fn std_command_from_ssh_spec(spec: &ssh::SshProcessSpec) -> Command {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
@@ -1417,6 +1422,12 @@ fn std_command_from_ssh_spec(spec: &ssh::SshProcessSpec) -> Command {
     }
     for (key, value) in &spec.env {
         command.env(key, value);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        command.creation_flags(ssh_test_creation_flags());
     }
     command
 }
@@ -2236,13 +2247,50 @@ mod task_three_tests {
         assert_ne!(worker_thread, caller_thread);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_ssh_test_process_hides_console_window() {
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        assert_eq!(super::ssh_test_creation_flags(), CREATE_NO_WINDOW);
+    }
+
+    fn failing_ssh_test_command() -> Command {
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/Q", "/C", "echo Permission denied 1>&2 & exit /b 7"]);
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                "printf '\\033[31mPermission denied\\033[0m\\n' >&2; exit 7",
+            ]);
+            command
+        }
+    }
+
+    fn sleeping_ssh_test_command() -> Command {
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/Q", "/C", "ping -n 6 127.0.0.1 >NUL"]);
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 5"]);
+            command
+        }
+    }
+
     #[test]
     fn ssh_test_process_checks_exit_status_and_sanitizes_stderr() {
-        let mut command = Command::new("/bin/sh");
-        command.args([
-            "-c",
-            "printf '\\033[31mPermission denied\\033[0m\\n' >&2; exit 7",
-        ]);
+        let command = failing_ssh_test_command();
 
         let error = run_ssh_test_process(command, Duration::from_secs(2), None).unwrap_err();
 
@@ -2253,8 +2301,7 @@ mod task_three_tests {
 
     #[test]
     fn ssh_test_process_kills_and_reaps_on_timeout() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 5"]);
+        let command = sleeping_ssh_test_command();
         let started = Instant::now();
 
         let error = run_ssh_test_process(command, Duration::from_millis(50), None).unwrap_err();
