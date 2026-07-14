@@ -2174,6 +2174,7 @@ mod task_three_tests {
             "set /P \"line=\" & echo __TERMINAL_CODEX_CONPTY__!line! & exit /B 0",
         ]);
         let mut child = pair.slave.spawn_command(command).unwrap();
+        let mut killer = child.clone_killer();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
         let mut writer = pair.master.take_writer().unwrap();
@@ -2186,15 +2187,48 @@ mod task_three_tests {
             })
             .unwrap();
         let (output_sender, output_receiver) = mpsc::channel();
+        let (cursor_query_sender, cursor_query_receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let mut output = Vec::new();
-            let result = reader.read_to_end(&mut output).map(|_| output);
+            let mut cursor_query_reported = false;
+            let result: std::io::Result<Vec<u8>> = (|| {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let size = reader.read(&mut buffer)?;
+                    if size == 0 {
+                        return Ok(output);
+                    }
+                    output.extend_from_slice(&buffer[..size]);
+                    if !cursor_query_reported
+                        && output.windows(4).any(|window| window == b"\x1b[6n")
+                    {
+                        cursor_query_reported = true;
+                        let _ = cursor_query_sender.send(());
+                    }
+                }
+            })();
             let _ = output_sender.send(result);
         });
+        let (status_sender, status_receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = status_sender.send(child.wait());
+        });
 
+        if let Err(error) = cursor_query_receiver.recv_timeout(Duration::from_secs(5)) {
+            let _ = killer.kill();
+            panic!("Windows ConPTY 未发出光标位置查询：{error}");
+        }
+        // ConPTY asks the host for a cursor position before forwarding keyboard input.
+        writer.write_all(b"\x1b[1;1R").unwrap();
         writer.write_all(b"round-trip\r\n").unwrap();
         writer.flush().unwrap();
-        let status = child.wait().unwrap();
+        let status = match status_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(status) => status.unwrap(),
+            Err(error) => {
+                let _ = killer.kill();
+                panic!("Windows ConPTY 测试进程未按时退出：{error}");
+            }
+        };
         drop(writer);
         drop(pair.master);
         let output = output_receiver
