@@ -36,8 +36,7 @@ lerna-debug.log*
 !.env.example
 
 # IDE and OS files
-.vscode/*
-!.vscode/extensions.json
+.vscode/
 .idea/
 .DS_Store
 src-tauri/.DS_Store
@@ -46,3 +45,6 @@ src-tauri/.DS_Store
 *.njsproj
 *.sln
 *.sw?
+
+# Local project docs
+docs/
