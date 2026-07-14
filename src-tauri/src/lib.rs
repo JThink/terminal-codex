@@ -2165,13 +2165,13 @@ mod task_three_tests {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new("cmd.exe");
+        let mut command = CommandBuilder::new("powershell.exe");
         command.args([
-            "/D",
-            "/Q",
-            "/V:ON",
-            "/C",
-            "set /P \"line=\" & echo __TERMINAL_CODEX_CONPTY__!line! & exit /B 0",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$line = [Console]::In.ReadLine(); [Console]::Out.WriteLine('__TERMINAL_CODEX_CONPTY__' + $line); exit 0",
         ]);
         let mut child = pair.slave.spawn_command(command).unwrap();
         let mut killer = child.clone_killer();
