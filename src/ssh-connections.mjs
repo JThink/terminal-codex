@@ -1,5 +1,6 @@
 const SSH_AUTH_TYPES = new Set(["agent", "key", "password"]);
 const DEFAULT_RECENT_SSH_PROFILE_LIMIT = 8;
+const SSH_LAUNCHER_ADD_ACTION_ID = "__add_ssh_connection__";
 
 const text = (value) => (typeof value === "string" ? value.trim() : "");
 
@@ -145,6 +146,63 @@ export const getSshLauncherProfiles = (profiles, query, recentIds) => {
     normalizedRecentIds.has(text(profile?.id))
   );
   return recentProfiles.length ? recentProfiles : filtered;
+};
+
+export const removeSshProfileById = (profiles, profileId) => {
+  const removedId = text(profileId);
+  return Array.isArray(profiles)
+    ? profiles.filter((profile) => text(profile?.id) !== removedId)
+    : [];
+};
+
+export const getSshLauncherAddActionId = () => SSH_LAUNCHER_ADD_ACTION_ID;
+
+export const isSshLauncherAddActionId = (value) =>
+  text(value) === SSH_LAUNCHER_ADD_ACTION_ID;
+
+export const getSshLauncherActiveProfileId = (profiles, activeProfileId) => {
+  const visibleProfiles = Array.isArray(profiles) ? profiles : [];
+  const activeId = text(activeProfileId);
+  if (isSshLauncherAddActionId(activeId)) {
+    return SSH_LAUNCHER_ADD_ACTION_ID;
+  }
+  if (activeId && visibleProfiles.some((profile) => text(profile?.id) === activeId)) {
+    return activeId;
+  }
+  return text(visibleProfiles[0]?.id) || SSH_LAUNCHER_ADD_ACTION_ID;
+};
+
+export const moveSshLauncherActiveProfileId = (profiles, activeProfileId, offset) => {
+  const visibleProfiles = Array.isArray(profiles) ? profiles : [];
+  const step = Number(offset);
+  if (!Number.isFinite(step) || step === 0) {
+    return getSshLauncherActiveProfileId(visibleProfiles, activeProfileId);
+  }
+  const activeId = getSshLauncherActiveProfileId(visibleProfiles, activeProfileId);
+  const itemCount = visibleProfiles.length + 1;
+  const currentIndex = isSshLauncherAddActionId(activeId)
+    ? visibleProfiles.length
+    : Math.max(
+        0,
+        visibleProfiles.findIndex((profile) => text(profile?.id) === activeId)
+      );
+  const nextIndex = (currentIndex + Math.sign(step) + itemCount) % itemCount;
+  return nextIndex === visibleProfiles.length
+    ? SSH_LAUNCHER_ADD_ACTION_ID
+    : text(visibleProfiles[nextIndex]?.id) || SSH_LAUNCHER_ADD_ACTION_ID;
+};
+
+export const getSshLauncherTargetProfile = (profiles, activeProfileId) => {
+  const visibleProfiles = Array.isArray(profiles) ? profiles : [];
+  const activeId = getSshLauncherActiveProfileId(visibleProfiles, activeProfileId);
+  if (isSshLauncherAddActionId(activeId)) {
+    return null;
+  }
+  return (
+    visibleProfiles.find((profile) => text(profile?.id) === activeId) ||
+    visibleProfiles[0] ||
+    null
+  );
 };
 
 export const normalizeLaunchSpec = (launchSpec, legacyCwd = null) => {

@@ -308,6 +308,15 @@ impl SshProfileView {
     }
 }
 
+fn profile_has_saved_password_hint(profile: &ssh::SshProfile) -> bool {
+    profile.auth_type == ssh::SshAuthType::Password
+        && profile
+            .credential_revision
+            .as_deref()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .is_some()
+}
+
 const CODEX_HISTORY_REFRESH_INTERVAL_MS: u128 = 1_500;
 
 fn now_epoch_ms() -> u128 {
@@ -1491,13 +1500,7 @@ fn list_ssh_profiles(
     ssh::load_profiles(&profiles_path)?
         .into_iter()
         .map(|profile| {
-            let has_password = if profile.auth_type == ssh::SshAuthType::Password {
-                ssh::CredentialStore::get(&credentials, &profile.id)
-                    .map_err(|error| format!("无法读取 SSH 密码凭据：{error}"))?
-                    .is_some()
-            } else {
-                false
-            };
+            let has_password = profile_has_saved_password_hint(&profile);
             Ok(SshProfileView::new(profile, has_password))
         })
         .collect()
@@ -1836,7 +1839,7 @@ pub fn run() {
 mod task_three_tests {
     use super::{
         close_map_entry, finish_child_reaper, run_ssh_test_blocking_task, run_ssh_test_process,
-        TerminalOutput,
+        ssh, TerminalOutput,
     };
     use portable_pty::{ChildKiller, ExitStatus};
     use std::{
@@ -1980,5 +1983,28 @@ mod task_three_tests {
 
         assert_eq!(error, "SSH 连接测试超时。");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn password_hint_comes_from_profile_binding_without_keychain_reads() {
+        let mut password = ssh::SshProfile {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Password".into(),
+            host: "example.com".into(),
+            port: 22,
+            username: "deploy".into(),
+            auth_type: ssh::SshAuthType::Password,
+            identity_file: None,
+            connect_timeout: 15,
+            credential_revision: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        assert!(super::profile_has_saved_password_hint(&password));
+
+        password.credential_revision = Some("not-a-uuid".into());
+        assert!(!super::profile_has_saved_password_hint(&password));
+
+        password.auth_type = ssh::SshAuthType::Agent;
+        password.credential_revision = Some(uuid::Uuid::new_v4().to_string());
+        assert!(!super::profile_has_saved_password_hint(&password));
     }
 }

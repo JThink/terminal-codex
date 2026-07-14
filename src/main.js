@@ -4,10 +4,16 @@ import {
   cloneLaunchSpec,
   filterSshProfiles,
   formatSshEndpoint,
+  getSshLauncherAddActionId,
+  getSshLauncherActiveProfileId,
   getSshLauncherProfiles,
+  getSshLauncherTargetProfile,
+  isSshLauncherAddActionId,
+  moveSshLauncherActiveProfileId,
   normalizeLaunchSpec,
   normalizeRecentProfileIds,
   pushRecentProfileId,
+  removeSshProfileById,
   resolveSshLaunchProfile,
   serializeLaunchSpec,
   terminalBytes,
@@ -517,6 +523,7 @@ let sshProfilesRequestGeneration = 0;
 let sshConnectionsRequestGeneration = 0;
 let sshConnectionsView = "recent";
 let sshRecentProfileIds = [];
+let sshRecentActiveProfileId = null;
 
 const loadRecentSshProfileIds = () => {
   try {
@@ -551,6 +558,34 @@ const forgetRecentSshProfile = (profileId) => {
     SSH_RECENT_PROFILE_LIMIT
   );
   saveRecentSshProfileIds();
+};
+
+const getVisibleSshProfiles = () =>
+  sshConnectionsView === "recent"
+    ? getSshLauncherProfiles(
+        sshProfiles,
+        sshConnectionsSearchInput.value,
+        sshRecentProfileIds
+      )
+    : filterSshProfiles(sshProfiles, sshConnectionsSearchInput.value);
+
+const syncSshRecentActiveProfile = (visibleProfiles) => {
+  sshRecentActiveProfileId = getSshLauncherActiveProfileId(
+    visibleProfiles,
+    sshRecentActiveProfileId
+  );
+};
+
+const scrollSshRecentActiveProfileIntoView = () => {
+  if (sshConnectionsView !== "recent" || !sshRecentActiveProfileId) {
+    return;
+  }
+  const activeElement = isSshLauncherAddActionId(sshRecentActiveProfileId)
+    ? sshConnectionsList.querySelector(".ssh-connections-add-row")
+    : sshConnectionsList.querySelector(
+        `[data-profile-id="${CSS.escape(sshRecentActiveProfileId)}"]`
+      );
+  activeElement?.scrollIntoView({ block: "nearest" });
 };
 
 const getSshProfilesFromResponse = (response) => {
@@ -666,6 +701,10 @@ const setSshConnectionsView = (view) => {
   sshConnectionsDialog.classList.toggle("form-view", isFormView);
   sshConnectionsDialog.classList.toggle("recent-view", !isFormView);
   sshConnectionsBackButton.hidden = !isFormView;
+  sshConnectionsListTitle.textContent = isFormView ? "已保存连接" : "最近";
+  sshConnectionsSearchInput.placeholder = isFormView
+    ? "搜索已保存连接"
+    : "选择配置或输入地址";
   sshConnectionsTitle.textContent = isFormView
     ? selectedSshProfileId
       ? "编辑 SSH 连接"
@@ -700,7 +739,11 @@ const openSshConnectionForm = (profile = null) => {
   if (sshConnectionOperationInFlight) {
     return;
   }
+  if (sshConnectionsView === "recent") {
+    sshConnectionsSearchInput.value = "";
+  }
   renderSshConnectionForm(profile);
+  renderSshConnectionsList();
   requestAnimationFrame(() => {
     if (!isSshConnectionsVisible() || sshConnectionsView !== "form") {
       return;
@@ -709,7 +752,11 @@ const openSshConnectionForm = (profile = null) => {
   });
 };
 
-const showSshConnectionsRecentView = () => {
+const showSshConnectionsRecentView = ({ resetSearch = false } = {}) => {
+  if (resetSearch) {
+    sshConnectionsSearchInput.value = "";
+  }
+  sshRecentActiveProfileId = null;
   setSshConnectionsView("recent");
   setSshConnectionsStatus();
   renderSshConnectionsList();
@@ -722,73 +769,111 @@ const showSshConnectionsRecentView = () => {
 };
 
 const renderSshConnectionsList = () => {
-  const visibleProfiles = getSshLauncherProfiles(
-    sshProfiles,
-    sshConnectionsSearchInput.value,
-    sshRecentProfileIds
-  );
+  const isRecentView = sshConnectionsView === "recent";
+  const visibleProfiles = getVisibleSshProfiles();
+  if (isRecentView) {
+    syncSshRecentActiveProfile(visibleProfiles);
+  }
   const fragment = document.createDocumentFragment();
   for (const profile of visibleProfiles) {
-    const row = document.createElement("div");
-    row.className = "ssh-connections-row";
-    const selected = profile.id === selectedSshProfileId;
-    row.classList.toggle("active", selected);
+    if (isRecentView) {
+      const row = document.createElement("div");
+      row.className = "ssh-connections-row";
+      row.classList.toggle("active", profile.id === sshRecentActiveProfileId);
+      row.dataset.profileId = profile.id;
+
+      const main = document.createElement("button");
+      main.type = "button";
+      main.className = "ssh-connections-row-main";
+      main.disabled = sshConnectionOperationInFlight;
+      main.setAttribute("aria-label", `连接到 ${profile.name}`);
+
+      const icon = document.createElement("span");
+      icon.className = "ssh-connections-row-icon";
+      icon.textContent = "↻";
+
+      const summary = document.createElement("span");
+      summary.className = "ssh-connections-row-summary";
+
+      const name = document.createElement("span");
+      name.className = "ssh-connections-row-name";
+      name.textContent = profile.name;
+      const endpoint = document.createElement("span");
+      endpoint.className = "ssh-connections-row-endpoint";
+      endpoint.textContent = formatSshEndpoint(profile);
+      summary.appendChild(name);
+      summary.appendChild(endpoint);
+      main.appendChild(icon);
+      main.appendChild(summary);
+      main.addEventListener("click", () => {
+        if (!sshConnectionOperationInFlight) {
+          sshRecentActiveProfileId = profile.id;
+          void connectSshProfile(profile);
+        }
+      });
+
+      const editButton = document.createElement("button");
+      editButton.type = "button";
+      editButton.className = "ssh-connections-row-edit";
+      editButton.textContent = "编辑";
+      editButton.disabled = sshConnectionOperationInFlight;
+      editButton.addEventListener("click", () => openSshConnectionForm(profile));
+
+      row.appendChild(main);
+      row.appendChild(editButton);
+      fragment.appendChild(row);
+      continue;
+    }
+
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "ssh-connections-saved-row";
+    row.disabled = sshConnectionOperationInFlight;
     row.dataset.profileId = profile.id;
-
-    const main = document.createElement("button");
-    main.type = "button";
-    main.className = "ssh-connections-row-main";
-    main.disabled = sshConnectionOperationInFlight;
-    main.setAttribute("aria-label", `连接到 ${profile.name}`);
-
-    const icon = document.createElement("span");
-    icon.className = "ssh-connections-row-icon";
-    icon.textContent = "↻";
-
-    const summary = document.createElement("span");
-    summary.className = "ssh-connections-row-summary";
+    row.classList.toggle("active", profile.id === selectedSshProfileId);
 
     const name = document.createElement("span");
-    name.className = "ssh-connections-row-name";
+    name.className = "ssh-connections-saved-row-name";
     name.textContent = profile.name;
     const endpoint = document.createElement("span");
-    endpoint.className = "ssh-connections-row-endpoint";
+    endpoint.className = "ssh-connections-saved-row-endpoint";
     endpoint.textContent = formatSshEndpoint(profile);
-    summary.appendChild(name);
-    summary.appendChild(endpoint);
-    main.appendChild(icon);
-    main.appendChild(summary);
-    main.addEventListener("click", () => {
+    row.appendChild(name);
+    row.appendChild(endpoint);
+    row.addEventListener("click", () => {
       if (!sshConnectionOperationInFlight) {
-        void connectSshProfile(profile);
+        renderSshConnectionForm(profile);
+        renderSshConnectionsList();
       }
     });
-
-    const editButton = document.createElement("button");
-    editButton.type = "button";
-    editButton.className = "ssh-connections-row-edit";
-    editButton.textContent = "编辑";
-    editButton.disabled = sshConnectionOperationInFlight;
-    editButton.addEventListener("click", () => openSshConnectionForm(profile));
-
-    row.appendChild(main);
-    row.appendChild(editButton);
     fragment.appendChild(row);
   }
   if (!visibleProfiles.length) {
     const empty = document.createElement("div");
     empty.className = "ssh-connections-empty";
-    empty.textContent = sshProfiles.length ? "没有匹配的连接" : "暂无最近连接";
+    empty.textContent = sshProfiles.length
+      ? "没有匹配的连接"
+      : isRecentView
+        ? "暂无最近连接"
+        : "暂无已保存连接";
     fragment.appendChild(empty);
   }
   const addRow = document.createElement("button");
   addRow.type = "button";
-  addRow.className = "ssh-connections-add-row";
-  addRow.textContent = "+ 添加 SSH 连接";
+  addRow.className = isRecentView
+    ? "ssh-connections-add-row"
+    : "ssh-connections-saved-add-row";
+  if (isRecentView) {
+    addRow.classList.toggle("active", isSshLauncherAddActionId(sshRecentActiveProfileId));
+  }
+  addRow.textContent = isRecentView ? "+ 添加 SSH 连接" : "+ 新建 SSH 连接";
   addRow.disabled = sshConnectionOperationInFlight;
   addRow.addEventListener("click", () => openSshConnectionForm(null));
   fragment.appendChild(addRow);
   sshConnectionsList.replaceChildren(fragment);
+  if (isRecentView) {
+    scrollSshRecentActiveProfileIntoView();
+  }
 };
 
 const refreshSshProfiles = async ({ render = true, canApply = () => true } = {}) => {
@@ -823,6 +908,7 @@ const openSshConnections = async ({ profileId = null } = {}) => {
   invalidateSshConnectionOperation();
   hideContextMenu();
   sshRecentProfileIds = loadRecentSshProfileIds();
+  sshRecentActiveProfileId = null;
   sshConnectionsModal.classList.add("show");
   setSshConnectionsView("recent");
   setSshConnectionBusy(true);
@@ -850,7 +936,7 @@ const openSshConnections = async ({ profileId = null } = {}) => {
       if (profileId && selectedProfile) {
         openSshConnectionForm(selectedProfile);
       } else {
-        showSshConnectionsRecentView();
+        showSshConnectionsRecentView({ resetSearch: true });
       }
     });
   } catch {
@@ -981,17 +1067,12 @@ const deleteCurrentSshProfile = async () => {
     if (!isSshConnectionOperationCurrent(operationGeneration)) {
       return;
     }
+    sshProfiles = removeSshProfileById(sshProfiles, profileId);
     selectedSshProfileId = null;
-    await refreshSshProfiles({
-      render: false,
-      canApply: () => isSshConnectionOperationCurrent(operationGeneration),
-    });
-    if (!isSshConnectionOperationCurrent(operationGeneration)) {
-      return;
-    }
     forgetRecentSshProfile(profileId);
+    renderSshConnectionForm(null);
+    renderSshConnectionsList();
     setSshConnectionsStatus("已删除。", "success");
-    showSshConnectionsRecentView();
   } catch (error) {
     if (isSshConnectionOperationCurrent(operationGeneration)) {
       setSshConnectionsStatus(String(error), "error");
@@ -1004,8 +1085,53 @@ const deleteCurrentSshProfile = async () => {
 for (const [authType, button] of sshAuthButtons) {
   button.addEventListener("click", () => setSshAuthType(authType));
 }
-sshConnectionsSearchInput.addEventListener("input", renderSshConnectionsList);
-sshConnectionsBackButton.addEventListener("click", showSshConnectionsRecentView);
+sshConnectionsSearchInput.addEventListener("input", () => {
+  if (sshConnectionsView === "recent") {
+    sshRecentActiveProfileId = null;
+  }
+  renderSshConnectionsList();
+});
+sshConnectionsSearchInput.addEventListener("keydown", (event) => {
+  if (sshConnectionsView !== "recent" || sshConnectionOperationInFlight) {
+    return;
+  }
+  const visibleProfiles = getVisibleSshProfiles();
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    sshRecentActiveProfileId = moveSshLauncherActiveProfileId(
+      visibleProfiles,
+      sshRecentActiveProfileId,
+      event.key === "ArrowDown" ? 1 : -1
+    );
+    renderSshConnectionsList();
+    return;
+  }
+  if (event.key !== "Enter") {
+    return;
+  }
+  event.preventDefault();
+  const activeProfileId = getSshLauncherActiveProfileId(
+    visibleProfiles,
+    sshRecentActiveProfileId
+  );
+  if (isSshLauncherAddActionId(activeProfileId)) {
+    sshRecentActiveProfileId = getSshLauncherAddActionId();
+    openSshConnectionForm(null);
+    return;
+  }
+  const targetProfile = getSshLauncherTargetProfile(
+    visibleProfiles,
+    activeProfileId
+  );
+  if (!targetProfile) {
+    return;
+  }
+  sshRecentActiveProfileId = targetProfile.id;
+  void connectSshProfile(targetProfile);
+});
+sshConnectionsBackButton.addEventListener("click", () =>
+  showSshConnectionsRecentView({ resetSearch: true })
+);
 sshConnectionsCloseButton.addEventListener("click", closeSshConnections);
 sshConnectionsModal.addEventListener("click", (event) => {
   if (event.target === sshConnectionsModal) {

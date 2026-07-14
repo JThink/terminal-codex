@@ -8,9 +8,15 @@ import {
   cloneLaunchSpec,
   filterSshProfiles,
   formatSshEndpoint,
+  getSshLauncherAddActionId,
+  getSshLauncherActiveProfileId,
   getSshLauncherProfiles,
+  getSshLauncherTargetProfile,
+  isSshLauncherAddActionId,
+  moveSshLauncherActiveProfileId,
   normalizeLaunchSpec,
   pushRecentProfileId,
+  removeSshProfileById,
   resolveSshLaunchProfile,
   serializeLaunchSpec,
   terminalBytes,
@@ -71,6 +77,43 @@ test("launcher defaults to recently used SSH profiles in recent-first order", ()
 test("launcher search falls back to all matches while keeping recent results first", () => {
   assert.deepEqual(getSshLauncherProfiles(profiles, "o", ["two"]), [profiles[1], profiles[0]]);
   assert.deepEqual(getSshLauncherProfiles(profiles, "production", ["two"]), [profiles[0]]);
+});
+
+test("launcher keyboard selection defaults to the first match and wraps with arrows", () => {
+  const visibleProfiles = getSshLauncherProfiles(profiles, "", ["two", "one"]);
+  assert.equal(getSshLauncherActiveProfileId(visibleProfiles, ""), "two");
+  assert.equal(moveSshLauncherActiveProfileId(visibleProfiles, "two", 1), "one");
+  assert.equal(
+    moveSshLauncherActiveProfileId(visibleProfiles, "one", 1),
+    getSshLauncherAddActionId()
+  );
+  assert.equal(
+    moveSshLauncherActiveProfileId(visibleProfiles, getSshLauncherAddActionId(), 1),
+    "two"
+  );
+  assert.equal(
+    moveSshLauncherActiveProfileId(visibleProfiles, "two", -1),
+    getSshLauncherAddActionId()
+  );
+});
+
+test("launcher enter target uses the active match or falls back to the first one", () => {
+  const visibleProfiles = getSshLauncherProfiles(profiles, "o", ["two"]);
+  assert.equal(getSshLauncherTargetProfile(visibleProfiles, "one")?.id, "one");
+  assert.equal(getSshLauncherTargetProfile(visibleProfiles, "missing")?.id, "two");
+  assert.equal(getSshLauncherTargetProfile(visibleProfiles, getSshLauncherAddActionId()), null);
+  assert.equal(getSshLauncherTargetProfile([], "missing"), null);
+});
+
+test("launcher can select add action when there are no profile matches", () => {
+  assert.equal(getSshLauncherActiveProfileId([], ""), getSshLauncherAddActionId());
+  assert.equal(isSshLauncherAddActionId(getSshLauncherActiveProfileId([], "")), true);
+});
+
+test("removes a deleted SSH profile from the loaded list", () => {
+  assert.deepEqual(removeSshProfileById(profiles, "one"), [profiles[1]]);
+  assert.deepEqual(removeSshProfileById(profiles, "missing"), profiles);
+  assert.deepEqual(removeSshProfileById(null, "one"), []);
 });
 
 test("migrates legacy cwd into a local launch spec", () => {
