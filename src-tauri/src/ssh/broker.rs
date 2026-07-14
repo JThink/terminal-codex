@@ -2414,7 +2414,7 @@ mod tests {
             Arc::clone(&verifier) as Arc<dyn super::IdentityVerifier>,
             Arc::new(FakeClock::new()),
             ASKPASS_TICKET_TTL,
-            Duration::from_millis(900),
+            Duration::from_millis(1_500),
         );
         let pending = registry.register(snapshot()).unwrap();
 
