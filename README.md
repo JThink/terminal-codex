@@ -102,5 +102,6 @@ GitHub Actions 在 macOS 与 Windows 原生 runner 上重复测试、Clippy 和�
 - `src-tauri/src/lib.rs`：Tauri 命令、PTY 会话和事件桥接；
 - `src-tauri/src/platform.rs`：Shell、OpenSSH、HOME 与进程平台适配；
 - `src-tauri/src/ssh/`：SSH 参数、本地 vault 事务和 ASKPASS broker；
+- `src-tauri/vendor/portable-pty/`：`portable-pty 0.9.0` 与 Windows 进程终止上游补丁；
 - `src-tauri/tauri.*.conf.json`：公共、macOS 与 Windows 打包配置；
 - `.github/workflows/cross-platform.yml`：双平台原生测试与打包。

@@ -19,6 +19,7 @@
 - `src-tauri/src/lib.rs`：PTY 会话、Tauri 命令与事件桥接逻辑
 - `src-tauri/src/platform.rs`：Shell、OpenSSH、HOME、路径与进程平台适配
 - `src-tauri/src/ssh/`：SSH 参数、本地 vault 凭据事务与 ASKPASS broker
+- `src-tauri/vendor/portable-pty/`：`portable-pty 0.9.0` 与 Windows kill 上游补丁
 - `src-tauri/tauri.conf.json`：平台公共窗口、安全与图标配置
 - `src-tauri/tauri.macos.conf.json`：macOS Overlay 标题栏与 app/dmg 配置
 - `src-tauri/tauri.windows.conf.json`：Windows 系统标题栏、NSIS 与 WebView2 配置
@@ -43,6 +44,7 @@
 - Rust：遵循 `rustfmt` 默认格式，错误信息使用中文描述
 - 前端：函数职责清晰，命名简洁统一；页面类名采用 `kebab-case`
 - 资源文件：第三方脚本放入 `src/vendor/`，保持与上游文件名一致
+- vendored Rust 依赖：保留许可证，并在 `PATCHES.md` 记录版本、补丁来源与上游提交
 - 平台逻辑：系统能力集中在 `platform.rs` 或 `platform.mjs`，业务代码避免散落平台判断
 
 ## 核心功能与交互
@@ -96,7 +98,7 @@
 涉及 Unix socket、AF_UNIX 或本机 SSH 的测试在受限沙箱中可能需要额外系统权限，不能把
 `Operation not permitted` 当作业务断言失败。macOS 本地的 Windows target 只能证明条件
 编译，并需要先安装 Homebrew LLVM；Windows 原生 GitHub Actions 才能证明测试、Clippy
-和 NSIS 打包。
+和 NSIS 打包。Windows 测试包含真实 ConPTY 输入、resize、输出和进程关闭冒烟用例。
 
 ## 提交与合并请求规范
 

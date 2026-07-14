@@ -1895,6 +1895,10 @@ mod task_three_tests {
     };
     use crate::platform::PlatformKind;
     use portable_pty::{ChildKiller, ExitStatus};
+    #[cfg(windows)]
+    use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+    #[cfg(windows)]
+    use std::io::{Read, Write};
     use std::{
         collections::HashMap,
         fmt,
@@ -2142,6 +2146,82 @@ mod task_three_tests {
         finish_child_reaper(&mut killer, waiter).unwrap();
 
         assert_eq!(kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conpty_round_trips_input_and_resizes() {
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.args(["/D", "/Q"]);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        pair.master
+            .resize(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let (output_sender, output_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            let result = reader.read_to_end(&mut output).map(|_| output);
+            let _ = output_sender.send(result);
+        });
+
+        writer
+            .write_all(b"echo __TERMINAL_CODEX_CONPTY__\r\nexit\r\n")
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let status = child.wait().unwrap();
+        drop(pair.master);
+        let output = output_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+
+        assert!(status.success());
+        assert!(String::from_utf8_lossy(&output).contains("__TERMINAL_CODEX_CONPTY__"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conpty_running_child_closes_cleanly() {
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.args(["/D", "/Q", "/C", "ping -n 30 127.0.0.1 >NUL"]);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        let mut killer = child.clone_killer();
+        let waiter = thread::spawn(move || {
+            child
+                .wait()
+                .map_err(|error| format!("无法等待 Windows ConPTY 测试进程：{error}"))
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        let started = Instant::now();
+
+        finish_child_reaper(killer.as_mut(), waiter).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
