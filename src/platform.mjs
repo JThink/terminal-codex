@@ -99,7 +99,7 @@ export const detectPlatform = (navigatorPlatform, userAgent) => {
   if (/\b(?:Win32|Win64|Windows(?: NT)?)\b/i.test(platformSignal)) {
     return "windows";
   }
-  if (/\b(?:MacIntel|Macintosh|macOS)\b/i.test(platformSignal)) {
+  if (/\b(?:MacIntel|Macintosh|macOS|Mac OS X)\b/i.test(platformSignal)) {
     return "macos";
   }
   return "unknown";

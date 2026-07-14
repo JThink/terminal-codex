@@ -51,6 +51,7 @@ test("detects Windows, macOS, and unknown platforms without assuming macOS", () 
   assert.equal(detectPlatform("Windows", ""), "windows");
   assert.equal(detectPlatform("MacIntel", ""), "macos");
   assert.equal(detectPlatform("", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"), "macos");
+  assert.equal(detectPlatform("", "Mozilla/5.0 (Intel Mac OS X 14_5)"), "macos");
   assert.equal(detectPlatform("macOS", ""), "macos");
   assert.equal(detectPlatform("Linux x86_64", "Mozilla/5.0 (X11; Linux x86_64)"), "unknown");
   assert.equal(detectPlatform("", ""), "unknown");
