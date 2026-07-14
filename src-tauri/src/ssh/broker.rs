@@ -716,7 +716,8 @@ impl PendingAskpassTicket {
     }
 
     pub(crate) fn bind(mut self, ssh_pid: u32) -> Result<BoundAskpassTicket, String> {
-        let binding = bind_ssh_with_retry(&self.registry.verifier, ssh_pid, self.registry.bind_wait)?;
+        let binding =
+            bind_ssh_with_retry(&self.registry.verifier, ssh_pid, self.registry.bind_wait)?;
         {
             let mut state = self
                 .registry
