@@ -146,11 +146,69 @@ enum SessionType {
     Ssh,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalLaunchSnapshot {
+    cwd: PathBuf,
+    env: HashMap<String, String>,
+}
+
+fn clone_source_from(
+    live_cwd: Option<PathBuf>,
+    live_env: Option<HashMap<String, String>>,
+    snapshot: &LocalLaunchSnapshot,
+) -> LocalLaunchSnapshot {
+    LocalLaunchSnapshot {
+        cwd: live_cwd.unwrap_or_else(|| snapshot.cwd.clone()),
+        env: live_env.unwrap_or_else(|| snapshot.env.clone()),
+    }
+}
+
+fn prepare_local_environment(
+    platform: platform::PlatformKind,
+    mut envs: HashMap<String, String>,
+    runtime_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    envs.retain(|key, value| {
+        !key.eq_ignore_ascii_case("PWD") && !value.contains(['\0', '\r', '\n'])
+    });
+
+    let runtime_value = |key: &str| {
+        runtime_env
+            .get(key)
+            .filter(|value| !value.contains(['\0', '\r', '\n']))
+            .cloned()
+    };
+    envs.entry("TERM".to_string())
+        .or_insert_with(|| runtime_value("TERM").unwrap_or_else(|| "xterm-256color".to_string()));
+    envs.entry("COLORTERM".to_string())
+        .or_insert_with(|| runtime_value("COLORTERM").unwrap_or_else(|| "truecolor".to_string()));
+
+    if platform == platform::PlatformKind::MacOs
+        && !envs.contains_key("LANG")
+        && !envs.contains_key("LC_ALL")
+        && !envs.contains_key("LC_CTYPE")
+    {
+        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .into_iter()
+            .filter_map(runtime_value)
+            .find(|value| {
+                let lower = value.to_ascii_lowercase();
+                lower.contains("utf-8") || lower.contains("utf8")
+            })
+            .unwrap_or_else(|| "en_US.UTF-8".to_string());
+        envs.insert("LANG".to_string(), locale.clone());
+        envs.insert("LC_CTYPE".to_string(), locale);
+    }
+
+    envs
+}
+
 struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     process_id: Option<u32>,
     session_type: SessionType,
+    local_launch: Option<LocalLaunchSnapshot>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     child_reaper: Option<thread::JoinHandle<Result<PtyExitStatus, String>>>,
     _askpass_ticket: Option<ssh::BoundAskpassTicket>,
@@ -337,22 +395,8 @@ fn now_epoch_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn resolve_codex_home() -> Option<PathBuf> {
-    if let Ok(path) = env::var("CODEX_HOME") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".codex"))
-}
-
 fn codex_sessions_root() -> Result<PathBuf, String> {
-    resolve_codex_home()
-        .map(|home| home.join("sessions"))
-        .ok_or_else(|| "无法定位 CODEX_HOME 目录。".to_string())
+    platform::codex_home().map(|home| home.join("sessions"))
 }
 
 #[derive(Clone)]
@@ -902,21 +946,6 @@ fn validate_session_key(session_key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn build_shell_command(shell_override: Option<&str>, cwd: Option<&str>) -> CommandBuilder {
-    let shell = shell_override
-        .map(|value| value.to_string())
-        .or_else(|| env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/zsh".to_string());
-    let mut command = CommandBuilder::new(shell);
-    command.arg("-l");
-    if let Some(cwd) = cwd {
-        command.cwd(cwd);
-    } else if let Ok(home) = env::var("HOME") {
-        command.cwd(home);
-    }
-    command
-}
-
 #[cfg(target_os = "macos")]
 mod macos_process {
     use super::*;
@@ -980,7 +1009,7 @@ mod macos_process {
         ) -> c_int;
     }
 
-    pub(super) fn read_cwd(pid: u32) -> Result<String, String> {
+    pub(super) fn read_cwd(pid: u32) -> Result<PathBuf, String> {
         let mut info: ProcVnodePathInfo = unsafe { mem::zeroed() };
         let result = unsafe {
             proc_pidinfo(
@@ -995,7 +1024,7 @@ mod macos_process {
             return Err("无法获取会话工作目录。".to_string());
         }
         let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr()) };
-        Ok(path.to_string_lossy().to_string())
+        Ok(PathBuf::from(path.to_string_lossy().into_owned()))
     }
 
     fn next_cstring(buffer: &[u8], offset: &mut usize) -> Option<String> {
@@ -1081,23 +1110,13 @@ mod macos_process {
 }
 
 #[cfg(target_os = "macos")]
-fn get_session_cwd(pid: u32) -> Result<String, String> {
+fn get_session_cwd(pid: u32) -> Result<PathBuf, String> {
     macos_process::read_cwd(pid)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn get_session_cwd(_pid: u32) -> Result<String, String> {
-    Err("当前平台暂不支持克隆工作目录。".to_string())
 }
 
 #[cfg(target_os = "macos")]
 fn get_session_env(pid: u32) -> Result<HashMap<String, String>, String> {
     macos_process::read_env(pid)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn get_session_env(_pid: u32) -> Result<HashMap<String, String>, String> {
-    Err("当前平台暂不支持克隆环境变量。".to_string())
 }
 
 fn finish_child_reaper(
@@ -1143,26 +1162,21 @@ fn close_map_entry<T>(
 fn spawn_pty_command(
     app: AppHandle,
     state: &AppState,
-    cols: u16,
-    rows: u16,
+    size: PtySize,
     command: CommandBuilder,
     session_type: SessionType,
+    local_launch: Option<LocalLaunchSnapshot>,
     pending_askpass_ticket: Option<ssh::PendingAskpassTicket>,
 ) -> Result<String, String> {
     let pty_system = NativePtySystem::default();
     let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|error| error.to_string())?;
+        .openpty(size)
+        .map_err(|error| format!("无法创建终端：{error}"))?;
 
     let mut child = pair
         .slave
         .spawn_command(command)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("无法启动会话进程：{error}"))?;
     let process_id = child.process_id();
     let killer = child.clone_killer();
     let askpass_ticket = match pending_askpass_ticket {
@@ -1193,7 +1207,7 @@ fn spawn_pty_command(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error.to_string());
+            return Err(format!("无法创建终端输出读取器：{error}"));
         }
     };
     let writer = match master.take_writer() {
@@ -1201,7 +1215,7 @@ fn spawn_pty_command(
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error.to_string());
+            return Err(format!("无法创建终端输入写入器：{error}"));
         }
     };
 
@@ -1210,12 +1224,17 @@ fn spawn_pty_command(
         state.counter.fetch_add(1, Ordering::SeqCst) + 1
     );
 
-    let child_reaper = thread::spawn(move || child.wait().map_err(|error| error.to_string()));
+    let child_reaper = thread::spawn(move || {
+        child
+            .wait()
+            .map_err(|error| format!("无法等待会话进程退出：{error}"))
+    });
     let session = Session {
         master,
         writer,
         process_id,
         session_type,
+        local_launch,
         killer,
         child_reaper: Some(child_reaper),
         _askpass_ticket: askpass_ticket,
@@ -1281,39 +1300,41 @@ fn spawn_session(
     cwd: Option<String>,
     envs: Option<HashMap<String, String>>,
 ) -> Result<String, String> {
-    let mut envs = envs.unwrap_or_default();
-
-    // Finder/Launchpad 启动的发行版环境通常缺少终端和 UTF-8 locale 设置。
-    envs.entry("TERM".to_string())
-        .or_insert_with(|| env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()));
-    envs.entry("COLORTERM".to_string())
-        .or_insert_with(|| env::var("COLORTERM").unwrap_or_else(|_| "truecolor".to_string()));
-    if !envs.contains_key("LANG") && !envs.contains_key("LC_ALL") && !envs.contains_key("LC_CTYPE")
-    {
-        let locale = env::var("LC_ALL")
-            .ok()
-            .or_else(|| env::var("LC_CTYPE").ok())
-            .or_else(|| env::var("LANG").ok())
-            .filter(|value| {
-                let lower = value.to_ascii_lowercase();
-                lower.contains("utf-8") || lower.contains("utf8")
-            })
-            .unwrap_or_else(|| "en_US.UTF-8".to_string());
-        envs.insert("LANG".to_string(), locale.clone());
-        envs.insert("LC_CTYPE".to_string(), locale);
-    }
-
+    let current_platform = platform::current_platform();
+    let runtime_env = ["TERM", "COLORTERM", "LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .filter_map(|key| env::var(key).ok().map(|value| (key.to_string(), value)))
+        .collect();
+    let envs = prepare_local_environment(current_platform, envs.unwrap_or_default(), &runtime_env);
     let shell_override = envs.get("SHELL").map(String::as_str);
-    let mut command = build_shell_command(shell_override, cwd.as_deref());
-    if let Some(cwd) = cwd.as_deref() {
-        command.env("PWD", cwd);
+    let shell_spec = platform::shell_spec(shell_override, cwd.as_deref())?;
+    let mut command = CommandBuilder::new(&shell_spec.program);
+    command.args(&shell_spec.args);
+    command.cwd(&shell_spec.cwd);
+    if current_platform == platform::PlatformKind::MacOs {
+        command.env("PWD", &shell_spec.cwd);
     }
-    for (key, value) in envs {
-        if key != "PWD" && !value.contains(['\0', '\n', '\r']) {
-            command.env(key, value);
-        }
+    for (key, value) in &envs {
+        command.env(key, value);
     }
-    spawn_pty_command(app, state, cols, rows, command, SessionType::Local, None)
+    let local_launch = LocalLaunchSnapshot {
+        cwd: shell_spec.cwd,
+        env: envs,
+    };
+    spawn_pty_command(
+        app,
+        state,
+        PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        command,
+        SessionType::Local,
+        Some(local_launch),
+        None,
+    )
 }
 
 fn ssh_profiles_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1597,10 +1618,15 @@ fn start_ssh_session(
     spawn_pty_command(
         app,
         state.inner(),
-        cols,
-        rows,
+        PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
         command,
         SessionType::Ssh,
+        None,
         pending_ticket,
     )
 }
@@ -1623,13 +1649,34 @@ fn start_session(
     spawn_session(app, state.inner(), cols, rows, cwd, None)
 }
 
-fn local_session_process_id(session: &Session) -> Result<u32, String> {
-    if session.session_type != SessionType::Local {
-        return Err("SSH 会话不支持读取或克隆本地工作目录。".to_string());
-    }
-    session
-        .process_id
-        .ok_or_else(|| "无法获取会话进程信息。".to_string())
+fn resolve_local_session_launch(
+    state: &AppState,
+    session_id: &str,
+) -> Result<LocalLaunchSnapshot, String> {
+    let (_process_id, snapshot) = {
+        let sessions = state.sessions.lock().map_err(|_| "无法获取会话锁。")?;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| "未找到对应的会话。".to_string())?;
+        if session.session_type != SessionType::Local {
+            return Err("SSH 会话不支持读取或克隆本地工作目录。".to_string());
+        }
+        let snapshot = session
+            .local_launch
+            .clone()
+            .ok_or_else(|| "本地会话缺少启动快照。".to_string())?;
+        (session.process_id, snapshot)
+    };
+
+    #[cfg(target_os = "macos")]
+    let (live_cwd, live_env) = (
+        _process_id.and_then(|pid| get_session_cwd(pid).ok()),
+        _process_id.and_then(|pid| get_session_env(pid).ok()),
+    );
+    #[cfg(windows)]
+    let (live_cwd, live_env): (Option<PathBuf>, Option<HashMap<String, String>>) = (None, None);
+
+    Ok(clone_source_from(live_cwd, live_env, &snapshot))
 }
 
 #[tauri::command]
@@ -1640,28 +1687,21 @@ fn clone_session(
     cols: u16,
     rows: u16,
 ) -> Result<String, String> {
-    let pid = {
-        let sessions = state.sessions.lock().map_err(|_| "无法获取会话锁。")?;
-        let session = sessions
-            .get(&session_id)
-            .ok_or_else(|| "未找到对应的会话。".to_string())?;
-        local_session_process_id(session)?
-    };
-    let cwd = get_session_cwd(pid)?;
-    let envs = get_session_env(pid).ok();
-    spawn_session(app, state.inner(), cols, rows, Some(cwd), envs)
+    let source = resolve_local_session_launch(state.inner(), &session_id)?;
+    spawn_session(
+        app,
+        state.inner(),
+        cols,
+        rows,
+        Some(source.cwd.to_string_lossy().into_owned()),
+        Some(source.env),
+    )
 }
 
 #[tauri::command]
 fn get_session_cwd_by_id(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
-    let pid = {
-        let sessions = state.sessions.lock().map_err(|_| "无法获取会话锁。")?;
-        let session = sessions
-            .get(&session_id)
-            .ok_or_else(|| "未找到对应的会话。".to_string())?;
-        local_session_process_id(session)?
-    };
-    get_session_cwd(pid)
+    resolve_local_session_launch(state.inner(), &session_id)
+        .map(|source| source.cwd.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -1669,16 +1709,9 @@ fn open_session_cwd_in_finder(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<(), String> {
-    let pid = {
-        let sessions = state.sessions.lock().map_err(|_| "无法获取会话锁。")?;
-        let session = sessions
-            .get(&session_id)
-            .ok_or_else(|| "未找到对应的会话。".to_string())?;
-        local_session_process_id(session)?
-    };
-    let cwd = get_session_cwd(pid)?;
-    tauri_plugin_opener::open_path(&cwd, Option::<&str>::None)
-        .map_err(|error| format!("无法打开访达：{error}"))?;
+    let source = resolve_local_session_launch(state.inner(), &session_id)?;
+    tauri_plugin_opener::open_path(&source.cwd, Option::<&str>::None)
+        .map_err(|error| format!("无法在文件管理器中打开目录：{error}"))?;
     Ok(())
 }
 
@@ -1854,13 +1887,15 @@ pub fn run() {
 #[cfg(test)]
 mod task_three_tests {
     use super::{
-        close_map_entry, finish_child_reaper, run_ssh_test_blocking_task, run_ssh_test_process,
-        ssh, TerminalOutput,
+        clone_source_from, close_map_entry, finish_child_reaper, prepare_local_environment,
+        run_ssh_test_blocking_task, run_ssh_test_process, ssh, LocalLaunchSnapshot, TerminalOutput,
     };
+    use crate::platform::PlatformKind;
     use portable_pty::{ChildKiller, ExitStatus};
     use std::{
         collections::HashMap,
         fmt,
+        path::PathBuf,
         process::Command,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -1870,6 +1905,149 @@ mod task_three_tests {
         time::{Duration, Instant},
     };
     use zeroize::Zeroizing;
+
+    fn environment(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn launch_snapshot(cwd: &str, env: &[(&str, &str)]) -> LocalLaunchSnapshot {
+        LocalLaunchSnapshot {
+            cwd: PathBuf::from(cwd),
+            env: environment(env),
+        }
+    }
+
+    #[test]
+    fn clone_source_prefers_live_cwd_and_environment() {
+        let snapshot = launch_snapshot(r"C:\Users\levi", &[("PATH", r"C:\Windows\System32")]);
+        let live_env = HashMap::from([("PATH".to_string(), "/opt/homebrew/bin".to_string())]);
+
+        let source = clone_source_from(
+            Some(PathBuf::from("/Users/levi/project")),
+            Some(live_env.clone()),
+            &snapshot,
+        );
+
+        assert_eq!(source.cwd, PathBuf::from("/Users/levi/project"));
+        assert_eq!(source.env, live_env);
+    }
+
+    #[test]
+    fn clone_source_falls_back_to_windows_launch_snapshot_without_live_data() {
+        let snapshot = launch_snapshot(
+            r"C:\work\terminal-codex",
+            &[("Path", r"C:\Windows\System32"), ("TERM", "xterm-256color")],
+        );
+
+        let source = clone_source_from(None, None, &snapshot);
+
+        assert_eq!(source, snapshot);
+    }
+
+    #[test]
+    fn clone_source_combines_live_cwd_with_snapshot_environment() {
+        let snapshot = launch_snapshot(r"C:\work\terminal-codex", &[("COLORTERM", "truecolor")]);
+
+        let source = clone_source_from(Some(PathBuf::from("/tmp/live-cwd")), None, &snapshot);
+
+        assert_eq!(source.cwd, PathBuf::from("/tmp/live-cwd"));
+        assert_eq!(source.env, snapshot.env);
+    }
+
+    #[test]
+    fn clone_source_clones_snapshot_environment_by_value() {
+        let snapshot =
+            launch_snapshot(r"C:\work\terminal-codex", &[("ORIGINAL", "snapshot-value")]);
+
+        let mut source = clone_source_from(None, None, &snapshot);
+        source
+            .env
+            .insert("ORIGINAL".to_string(), "changed".to_string());
+        source.env.insert("NEW".to_string(), "value".to_string());
+
+        assert_eq!(
+            snapshot.env.get("ORIGINAL").map(String::as_str),
+            Some("snapshot-value")
+        );
+        assert!(!snapshot.env.contains_key("NEW"));
+    }
+
+    #[test]
+    fn local_environment_filters_unsafe_values_and_pwd_before_adding_terminal_defaults() {
+        let provided = environment(&[
+            ("SAFE", "value"),
+            ("NUL", "bad\0value"),
+            ("CR", "bad\rvalue"),
+            ("LF", "bad\nvalue"),
+            ("pwd", "/must/not/override"),
+        ]);
+        let runtime = environment(&[("TERM", "bad\0term"), ("COLORTERM", "bad\ncolor")]);
+
+        let prepared = prepare_local_environment(PlatformKind::MacOs, provided, &runtime);
+
+        assert_eq!(prepared.get("SAFE").map(String::as_str), Some("value"));
+        assert_eq!(
+            prepared.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            prepared.get("COLORTERM").map(String::as_str),
+            Some("truecolor")
+        );
+        for key in ["NUL", "CR", "LF", "pwd"] {
+            assert!(!prepared.contains_key(key));
+        }
+    }
+
+    #[test]
+    fn macos_local_environment_injects_a_runtime_utf8_locale_when_missing() {
+        let runtime = environment(&[
+            ("LC_ALL", "C"),
+            ("LC_CTYPE", "zh_CN.UTF-8"),
+            ("LANG", "en_US.UTF-8"),
+        ]);
+
+        let prepared = prepare_local_environment(PlatformKind::MacOs, HashMap::new(), &runtime);
+
+        assert_eq!(
+            prepared.get("LANG").map(String::as_str),
+            Some("zh_CN.UTF-8")
+        );
+        assert_eq!(
+            prepared.get("LC_CTYPE").map(String::as_str),
+            Some("zh_CN.UTF-8")
+        );
+    }
+
+    #[test]
+    fn macos_local_environment_preserves_an_existing_locale() {
+        let prepared = prepare_local_environment(
+            PlatformKind::MacOs,
+            environment(&[("LANG", "C")]),
+            &environment(&[("LC_CTYPE", "en_US.UTF-8")]),
+        );
+
+        assert_eq!(prepared.get("LANG").map(String::as_str), Some("C"));
+        assert!(!prepared.contains_key("LC_CTYPE"));
+    }
+
+    #[test]
+    fn windows_local_environment_does_not_inject_unix_locale() {
+        let runtime = environment(&[
+            ("LC_ALL", "en_US.UTF-8"),
+            ("LC_CTYPE", "en_US.UTF-8"),
+            ("LANG", "en_US.UTF-8"),
+        ]);
+
+        let prepared = prepare_local_environment(PlatformKind::Windows, HashMap::new(), &runtime);
+
+        for key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            assert!(!prepared.contains_key(key));
+        }
+    }
 
     #[test]
     fn terminal_output_serializes_raw_bytes_without_utf8_conversion() {
