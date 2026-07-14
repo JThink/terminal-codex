@@ -182,6 +182,14 @@ impl ProcessInspector for RealProcessInspector {
     }
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_SNAPSHOT_MAX_ATTEMPTS: usize = 4;
+
+#[cfg(any(windows, test))]
+fn should_retry_windows_snapshot(error_code: i32, attempt: usize) -> bool {
+    error_code == 24 && attempt < WINDOWS_SNAPSHOT_MAX_ATTEMPTS
+}
+
 #[cfg(windows)]
 struct OwnedWindowsHandle(windows_sys::Win32::Foundation::HANDLE);
 
@@ -208,11 +216,24 @@ impl OwnedWindowsHandle {
             System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPPROCESS},
         };
 
-        let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err(windows_last_error("无法创建 Windows 进程快照"));
+        let mut attempt = 1;
+        loop {
+            let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                return Ok(Self(handle));
+            }
+
+            let error = io::Error::last_os_error();
+            if error
+                .raw_os_error()
+                .is_some_and(|code| should_retry_windows_snapshot(code, attempt))
+            {
+                attempt += 1;
+                thread::yield_now();
+                continue;
+            }
+            return Err(format!("无法创建 Windows 进程快照：{error}"));
         }
-        Ok(Self(handle))
     }
 
     fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
@@ -2119,6 +2140,22 @@ mod tests {
 
     fn digest_fixture(normalized_path: &[u16]) -> [u8; 20] {
         super::file_identity_digest(normalized_path, 0x1234_abcd, 0x5678, 0x9abc, 0xdef0)
+    }
+
+    #[test]
+    fn windows_snapshot_retry_accepts_bad_length_before_limit() {
+        assert!(super::should_retry_windows_snapshot(24, 1));
+        assert!(super::should_retry_windows_snapshot(24, 3));
+    }
+
+    #[test]
+    fn windows_snapshot_retry_stops_at_limit() {
+        assert!(!super::should_retry_windows_snapshot(24, 4));
+    }
+
+    #[test]
+    fn windows_snapshot_retry_rejects_other_errors() {
+        assert!(!super::should_retry_windows_snapshot(5, 1));
     }
 
     #[test]
