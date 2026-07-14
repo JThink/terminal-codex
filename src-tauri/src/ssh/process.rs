@@ -1,4 +1,5 @@
 use super::{validate_profile_for_connection, SshAuthType, SshProfile};
+use crate::platform;
 use std::{collections::BTreeMap, collections::BTreeSet, env, ffi::OsStr, fmt, path::Path};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -130,13 +131,15 @@ pub(crate) fn build_ssh_process_spec(
     askpass: Option<&AskpassLaunchEnv>,
     mode: SshMode,
 ) -> Result<SshProcessSpec, String> {
+    let ssh_executable = platform::resolve_ssh_executable()?;
     let executable =
         env::current_exe().map_err(|error| format!("无法获取当前应用可执行文件路径：{error}"))?;
-    build_ssh_process_spec_for_runtime(profile, &executable, askpass, mode)
+    build_ssh_process_spec_for_runtime(profile, &ssh_executable, &executable, askpass, mode)
 }
 
 fn build_ssh_process_spec_for_runtime(
     profile: &SshProfile,
+    ssh_executable: &Path,
     executable: &Path,
     askpass: Option<&AskpassLaunchEnv>,
     mode: SshMode,
@@ -144,6 +147,7 @@ fn build_ssh_process_spec_for_runtime(
     let parent_term = env::var_os("TERM");
     build_ssh_process_spec_for_runtime_with_term(
         profile,
+        ssh_executable,
         executable,
         askpass,
         mode,
@@ -153,6 +157,7 @@ fn build_ssh_process_spec_for_runtime(
 
 fn build_ssh_process_spec_for_runtime_with_term(
     profile: &SshProfile,
+    ssh_executable: &Path,
     executable: &Path,
     askpass: Option<&AskpassLaunchEnv>,
     mode: SshMode,
@@ -255,7 +260,7 @@ fn build_ssh_process_spec_for_runtime_with_term(
     }
 
     Ok(SshProcessSpec {
-        program: "/usr/bin/ssh".to_string(),
+        program: path_to_utf8(ssh_executable, "SSH 可执行文件")?,
         args,
         env,
         env_remove,
@@ -306,6 +311,7 @@ mod tests {
             .then(|| AskpassLaunchEnv::new(Path::new(ASKPASS_SOCKET), ASKPASS_TOKEN).unwrap());
         build_ssh_process_spec_for_runtime_with_term(
             profile,
+            Path::new("/usr/bin/ssh"),
             Path::new("/Applications/LeviQian Codex.app/Contents/MacOS/leviqian-codex"),
             launch.as_ref(),
             mode,
@@ -323,6 +329,7 @@ mod tests {
             .then(|| AskpassLaunchEnv::new(Path::new(ASKPASS_SOCKET), ASKPASS_TOKEN).unwrap());
         build_ssh_process_spec_for_runtime_with_term(
             profile,
+            Path::new("/usr/bin/ssh"),
             Path::new("/Applications/LeviQian Codex.app/Contents/MacOS/leviqian-codex"),
             launch.as_ref(),
             mode,
@@ -413,6 +420,40 @@ mod tests {
         assert!(spec.env.is_empty());
         assert_eq!(spec.env_remove, inherited_env_removals());
         assert!(!spec.env_remove.contains("DISPLAY"));
+    }
+
+    #[test]
+    fn injected_windows_ssh_executable_becomes_process_program() {
+        let ssh_executable = Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe");
+
+        let spec = build_ssh_process_spec_for_runtime(
+            &fixture_profile(SshAuthType::Agent),
+            ssh_executable,
+            Path::new("/tmp/leviqian-codex"),
+            None,
+            SshMode::Interactive,
+        )
+        .unwrap();
+
+        assert_eq!(spec.program, r"C:\Windows\System32\OpenSSH\ssh.exe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_ssh_executable_returns_chinese_error() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let ssh_executable = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/ssh-\xff"));
+        let error = build_ssh_process_spec_for_runtime(
+            &fixture_profile(SshAuthType::Agent),
+            ssh_executable,
+            Path::new("/tmp/leviqian-codex"),
+            None,
+            SshMode::Interactive,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "SSH 可执行文件不是有效的 UTF-8 路径。");
     }
 
     #[test]
@@ -622,6 +663,7 @@ mod tests {
         let rejects = |profile: &SshProfile| {
             build_ssh_process_spec_for_runtime(
                 profile,
+                Path::new("/usr/bin/ssh"),
                 Path::new("/tmp/app"),
                 None,
                 SshMode::Interactive,

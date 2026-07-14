@@ -1,7 +1,8 @@
+use crate::platform::{self, PlatformKind};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    env, fs,
+    fs,
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
@@ -157,14 +158,49 @@ fn normalize_connection_token(
     Ok(value.to_string())
 }
 
-fn expand_home_prefix(path: &str) -> Result<PathBuf, String> {
-    let Some(relative_path) = path.strip_prefix("~/") else {
+const HOME_EXPANSION_ERROR: &str = "无法展开私钥路径：无法定位用户主目录。";
+
+fn home_relative_path(path: &str, platform: PlatformKind) -> Option<&str> {
+    match platform {
+        PlatformKind::MacOs => path.strip_prefix("~/"),
+        PlatformKind::Windows => path.strip_prefix("~/").or_else(|| path.strip_prefix(r"~\")),
+    }
+}
+
+fn expand_home_prefix_with(
+    path: &str,
+    home: Option<&Path>,
+    platform: PlatformKind,
+) -> Result<PathBuf, String> {
+    let Some(relative_path) = home_relative_path(path, platform) else {
         return Ok(PathBuf::from(path));
     };
-    let home = env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "无法展开私钥路径：未设置 HOME。".to_string())?;
-    Ok(PathBuf::from(home).join(relative_path.trim_start_matches('/')))
+    let home = home
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or_else(|| HOME_EXPANSION_ERROR.to_string())?;
+    let separator = match platform {
+        PlatformKind::MacOs => '/',
+        PlatformKind::Windows => '\\',
+    };
+    let home_ends_with_separator = match platform {
+        PlatformKind::MacOs => home.to_string_lossy().ends_with('/'),
+        PlatformKind::Windows => home.to_string_lossy().ends_with(['/', '\\']),
+    };
+    let mut expanded = home.as_os_str().to_os_string();
+    if !home_ends_with_separator {
+        expanded.push(separator.to_string());
+    }
+    expanded.push(relative_path);
+    Ok(PathBuf::from(expanded))
+}
+
+fn expand_home_prefix(path: &str) -> Result<PathBuf, String> {
+    let platform = platform::current_platform();
+    if home_relative_path(path, platform).is_none() {
+        return Ok(PathBuf::from(path));
+    }
+    let home = platform::user_home().map_err(|_| HOME_EXPANSION_ERROR.to_string())?;
+    expand_home_prefix_with(path, Some(&home), platform)
 }
 
 pub(crate) fn validate_profile(profile: &SshProfile) -> Result<SshProfile, String> {
@@ -246,6 +282,49 @@ fn cleanup_temporary_file_after_save_error(path: &Path, save_error: String) -> S
             "{save_error}；清理 SSH 配置临时文件 {} 失败：{cleanup_error}",
             path.display()
         ),
+    }
+}
+
+#[cfg(unix)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::fs as filesystem;
+
+    filesystem::rename(source, destination).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::{io, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn nul_terminated_path(path: &Path, description: &str) -> Result<Vec<u16>, String> {
+        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if encoded.contains(&0) {
+            return Err(format!("{description}包含 NUL，无法原子替换文件。"));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+
+    let source = nul_terminated_path(source, "原子替换源文件路径")?;
+    let destination = nul_terminated_path(destination, "原子替换目标文件路径")?;
+    // SAFETY: both UTF-16 buffers are NUL-terminated and remain alive for the call.
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(format!(
+            "Windows 原子替换文件失败：{}",
+            io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -334,7 +413,7 @@ pub(crate) fn save_profiles(path: &Path, profiles: &[SshProfile]) -> Result<(), 
         })?;
         drop(file);
 
-        fs::rename(&temporary_path, path)
+        replace_file_atomically(&temporary_path, path)
             .map_err(|error| format!("无法替换 SSH 配置文件 {}：{error}", path.display()))?;
         temporary_file_created = false;
         sync_directory(parent)?;
@@ -371,11 +450,13 @@ pub(crate) fn generate_profile_id() -> String {
 mod tests {
     use super::credentials::{endpoint_fingerprint, CredentialRecord};
     use super::{
-        cleanup_temporary_file_after_save_error, delete_profile_transaction, generate_profile_id,
-        load_profiles, sanitize_ssh_error, save_profiles, upsert_profile_transaction,
-        validate_profile, validate_profile_for_connection, CredentialStore, CredentialUpdate,
-        ProfileRepository, SshAuthType, SshProfile, SSH_ERROR_LIMIT_CHARS,
+        cleanup_temporary_file_after_save_error, delete_profile_transaction,
+        expand_home_prefix_with, generate_profile_id, load_profiles, replace_file_atomically,
+        sanitize_ssh_error, save_profiles, upsert_profile_transaction, validate_profile,
+        validate_profile_for_connection, CredentialStore, CredentialUpdate, ProfileRepository,
+        SshAuthType, SshProfile, SSH_ERROR_LIMIT_CHARS,
     };
+    use crate::platform::PlatformKind;
     use std::{
         cell::{Cell, RefCell},
         collections::HashMap,
@@ -996,6 +1077,58 @@ mod tests {
     }
 
     #[test]
+    fn expands_windows_home_prefix_for_key_identity() {
+        let home = Path::new(r"C:\Users\levi");
+
+        assert_eq!(
+            expand_home_prefix_with(r"~\.ssh\id_ed25519", Some(home), PlatformKind::Windows)
+                .unwrap(),
+            PathBuf::from(r"C:\Users\levi\.ssh\id_ed25519")
+        );
+        assert_eq!(
+            expand_home_prefix_with("~/.ssh/id_ed25519", Some(home), PlatformKind::Windows)
+                .unwrap(),
+            PathBuf::from(r"C:\Users\levi\.ssh/id_ed25519")
+        );
+    }
+
+    #[test]
+    fn expands_macos_home_prefix_for_key_identity() {
+        assert_eq!(
+            expand_home_prefix_with(
+                "~/.ssh/id_ed25519",
+                Some(Path::new("/Users/levi")),
+                PlatformKind::MacOs,
+            )
+            .unwrap(),
+            PathBuf::from("/Users/levi/.ssh/id_ed25519")
+        );
+    }
+
+    #[test]
+    fn leaves_non_home_prefix_paths_unchanged() {
+        for path in ["~", "~other/.ssh/id_ed25519", r"~other\.ssh\id_ed25519"] {
+            assert_eq!(
+                expand_home_prefix_with(path, None, PlatformKind::Windows).unwrap(),
+                PathBuf::from(path)
+            );
+        }
+        assert_eq!(
+            expand_home_prefix_with(r"~\.ssh\id_ed25519", None, PlatformKind::MacOs).unwrap(),
+            PathBuf::from(r"~\.ssh\id_ed25519")
+        );
+    }
+
+    #[test]
+    fn home_prefix_without_home_returns_chinese_error() {
+        let error =
+            expand_home_prefix_with("~/.ssh/id_ed25519", None, PlatformKind::Windows).unwrap_err();
+
+        assert_eq!(error, "无法展开私钥路径：无法定位用户主目录。");
+        assert!(!error.contains(r"C:\Users\secret-user"));
+    }
+
+    #[test]
     fn expands_home_prefix_for_key_identity() {
         let home = PathBuf::from(std::env::var_os("HOME").expect("测试需要 HOME"));
         let file_name = format!(
@@ -1065,6 +1198,22 @@ mod tests {
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(document["version"], 1);
         assert_eq!(document["profiles"].as_array().unwrap().len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replace_file_atomically_overwrites_existing_destination() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.tmp");
+        let destination = dir.join("destination.json");
+        fs::write(&source, b"new contents").unwrap();
+        fs::write(&destination, b"old contents").unwrap();
+
+        replace_file_atomically(&source, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new contents");
+        assert!(!source.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

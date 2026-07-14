@@ -3,7 +3,7 @@ use super::{
         endpoint_fingerprint, CredentialRecord, CredentialStore, CredentialTransactionLock,
         CredentialUpdate, EndpointFingerprint, LaunchCredentialSnapshot,
     },
-    generate_profile_id, load_profiles, save_profiles, validate_profile,
+    generate_profile_id, load_profiles, replace_file_atomically, save_profiles, validate_profile,
     validate_profile_for_connection, SshAuthType, SshProfile,
 };
 use serde::{Deserialize, Serialize};
@@ -160,7 +160,7 @@ fn save_journal(path: &Path, journal: &CredentialJournal) -> Result<(), String> 
             )
         })?;
         drop(file);
-        fs::rename(&temporary, &journal_path).map_err(|error| {
+        replace_file_atomically(&temporary, &journal_path).map_err(|error| {
             format!(
                 "无法提交 SSH 凭据事务文件 {}：{error}",
                 journal_path.display()

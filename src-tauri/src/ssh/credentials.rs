@@ -1,6 +1,6 @@
-use super::SshProfile;
 #[cfg(test)]
 use super::{generate_profile_id, validate_profile, validate_profile_for_connection, SshAuthType};
+use super::{replace_file_atomically, SshProfile};
 use aes_gcm::{
     aead::{Aead, Payload},
     Aes256Gcm, KeyInit, Nonce,
@@ -387,7 +387,7 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         ));
     }
     drop(file);
-    fs::rename(&temporary, path).map_err(|error| {
+    replace_file_atomically(&temporary, path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         format!("无法替换 SSH 本地凭据文件 {}：{error}", path.display())
     })?;
