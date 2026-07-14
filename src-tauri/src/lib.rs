@@ -2241,7 +2241,15 @@ mod task_three_tests {
             status.success(),
             "Windows ConPTY 测试进程退出失败：{status:?}，输出：{output}"
         );
-        assert!(output.contains("__TERMINAL_CODEX_CONPTY__round-trip"));
+        let marker = "__TERMINAL_CODEX_CONPTY__";
+        let marker_offset = output.find(marker).unwrap_or_else(|| {
+            panic!("Windows ConPTY 输出缺少测试标记：{}", output.escape_debug())
+        });
+        assert!(
+            output[marker_offset + marker.len()..].contains("round-trip"),
+            "Windows ConPTY 标记后缺少回环输入：{}",
+            output.escape_debug()
+        );
     }
 
     #[cfg(windows)]
