@@ -68,6 +68,13 @@ pub(crate) fn peer_pid(_stream: &LocalStream) -> Result<u32, String> {
 }
 
 #[cfg(windows)]
+fn winsock_last_error() -> io::Error {
+    use windows_sys::Win32::Networking::WinSock::WSAGetLastError;
+
+    io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+}
+
+#[cfg(windows)]
 pub(crate) fn peer_pid(stream: &LocalStream) -> Result<u32, String> {
     use std::os::windows::io::AsRawSocket;
     use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SIO_AF_UNIX_GETPEERPID, SOCKET_ERROR};
@@ -90,7 +97,7 @@ pub(crate) fn peer_pid(stream: &LocalStream) -> Result<u32, String> {
     if result == SOCKET_ERROR {
         return Err(format!(
             "无法获取 ASKPASS socket 对端进程身份：{}",
-            io::Error::last_os_error()
+            winsock_last_error()
         ));
     }
     if bytes_returned as usize != std::mem::size_of::<u32>() {
@@ -108,6 +115,17 @@ pub(crate) fn peer_pid(stream: &LocalStream) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{bind, connect, peer_pid, socket_path_len, LocalListener, LocalStream};
+
+    #[cfg(windows)]
+    #[test]
+    fn winsock_last_error_reads_winsock_error_channel() {
+        use super::winsock_last_error;
+        use windows_sys::Win32::Networking::WinSock::{WSASetLastError, WSAEACCES};
+
+        unsafe { WSASetLastError(WSAEACCES) };
+
+        assert_eq!(winsock_last_error().raw_os_error(), Some(WSAEACCES));
+    }
 
     #[test]
     fn path_length_counts_transport_bytes() {
