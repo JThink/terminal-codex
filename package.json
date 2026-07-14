@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "test": "node --test src/*.test.mjs",
+    "test": "node --test",
     "check": "node --check src/main.js",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",

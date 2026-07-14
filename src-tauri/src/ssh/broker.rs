@@ -2894,22 +2894,28 @@ mod tests {
 
     #[test]
     fn bind_keeps_retrying_for_the_full_bind_wait_window() {
+        let bind_wait = Duration::from_millis(50);
         let verifier = Arc::new(DelayedBindIdentityVerifier {
-            transient_failures: Mutex::new(70),
+            transient_failures: Mutex::new(usize::MAX),
             attempts: AtomicUsize::new(0),
         });
         let registry = AskpassRegistry::with_dependencies(
             Arc::clone(&verifier) as Arc<dyn super::IdentityVerifier>,
             Arc::new(FakeClock::new()),
             ASKPASS_TICKET_TTL,
-            Duration::from_millis(1_500),
+            bind_wait,
         );
         let pending = registry.register(snapshot()).unwrap();
+        let started = Instant::now();
 
-        let bound = pending.bind(SSH_PID).unwrap();
+        let error = match pending.bind(SSH_PID) {
+            Ok(_) => panic!("持续的临时身份错误不应绑定成功"),
+            Err(error) => error,
+        };
 
-        assert!(verifier.attempts.load(AtomicOrdering::SeqCst) > 50);
-        drop(bound);
+        assert!(error.contains("SSH process has not execed yet"));
+        assert!(verifier.attempts.load(AtomicOrdering::SeqCst) >= 2);
+        assert!(started.elapsed() >= bind_wait);
     }
 
     #[test]
