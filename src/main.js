@@ -1,4 +1,10 @@
 import {
+  buildDefaultHotkeyDefinitions,
+  detectPlatform,
+  hotkeyStorageKeyForPlatform,
+  modifierTokensForPlatform,
+} from "./platform.mjs";
+import {
   beginSingleFlight,
   buildProfilePayload,
   cloneLaunchSpec,
@@ -20,6 +26,12 @@ import {
   isSingleFlightCurrent,
   withAuthType,
 } from "./ssh-connections.mjs";
+
+const APP_PLATFORM = detectPlatform(
+  navigator.userAgentData?.platform || navigator.platform,
+  navigator.userAgent
+);
+document.documentElement.dataset.platform = APP_PLATFORM;
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -272,26 +284,11 @@ const SPLIT_MIN_SIZE = 200;
 const PENDING_OUTPUT_MAX_SESSIONS = 32;
 const PENDING_OUTPUT_MAX_BYTES = 64 * 1024;
 
-const HOTKEYS_STORAGE_KEY = "codex-terminal-hotkeys";
+const HOTKEYS_STORAGE_KEY = hotkeyStorageKeyForPlatform(APP_PLATFORM);
 const SSH_RECENT_PROFILE_IDS_KEY = "codex-terminal-ssh-recent-profile-ids";
 const SSH_RECENT_PROFILE_LIMIT = 8;
-const DEFAULT_HOTKEYS = [
-  { id: "renameTab", label: "重命名标签", defaultKey: "⌘-R" },
-  { id: "cloneTab", label: "克隆标签", defaultKey: "⌘-D" },
-  { id: "newTab", label: "新建标签", defaultKey: "⌘-T" },
-  { id: "tabPrev", label: "切换到上一个标签", defaultKey: "⌘-Shift-Left" },
-  { id: "tabNext", label: "切换到下一个标签", defaultKey: "⌘-Shift-Right" },
-  { id: "paneLeft", label: "切换到左侧分屏", defaultKey: "⌘-Left" },
-  { id: "paneRight", label: "切换到右侧分屏", defaultKey: "⌘-Right" },
-  { id: "splitRight", label: "左右分屏", defaultKey: "⌘-Shift-D" },
-  { id: "closeSplit", label: "关闭分屏", defaultKey: "⌘-Shift-S" },
-  { id: "closeTab", label: "关闭标签", defaultKey: "⌘-W" },
-  { id: "fontIncrease", label: "字体增大", defaultKey: "⌘-=" },
-  { id: "fontDecrease", label: "字体减小", defaultKey: "⌘--" },
-  { id: "fontReset", label: "字体重置", defaultKey: "⌘-0" },
-  { id: "openSshConnections", label: "SSH 连接", defaultKey: "⌘-E" },
-  { id: "openHotkeySettings", label: "快捷键设置", defaultKey: "⌘-Shift-P" },
-];
+const DEFAULT_HOTKEYS = buildDefaultHotkeyDefinitions(APP_PLATFORM);
+const HOTKEY_MODIFIER_TOKENS = modifierTokensForPlatform(APP_PLATFORM);
 
 const tabsContainer = document.getElementById("tabs");
 const panelsContainer = document.getElementById("tab-panels");
@@ -3614,16 +3611,16 @@ const eventToHotkey = (event) => {
   const ignoreShift = event.key === "+" || event.key === "_";
   const modifiers = [];
   if (event.ctrlKey) {
-    modifiers.push("Ctrl");
+    modifiers.push(HOTKEY_MODIFIER_TOKENS.ctrl);
   }
   if (event.metaKey) {
-    modifiers.push("⌘");
+    modifiers.push(HOTKEY_MODIFIER_TOKENS.meta);
   }
   if (event.shiftKey && !ignoreShift) {
-    modifiers.push("Shift");
+    modifiers.push(HOTKEY_MODIFIER_TOKENS.shift);
   }
   if (event.altKey) {
-    modifiers.push("⌥");
+    modifiers.push(HOTKEY_MODIFIER_TOKENS.alt);
   }
 
   if (!modifiers.length) {
