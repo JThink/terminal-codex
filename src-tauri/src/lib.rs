@@ -2194,8 +2194,8 @@ mod task_three_tests {
 
         writer.write_all(b"round-trip\r\n").unwrap();
         writer.flush().unwrap();
-        drop(writer);
         let status = child.wait().unwrap();
+        drop(writer);
         drop(pair.master);
         let output = output_receiver
             .recv_timeout(Duration::from_secs(5))
