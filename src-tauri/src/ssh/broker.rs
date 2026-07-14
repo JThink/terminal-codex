@@ -832,7 +832,7 @@ impl AskpassRegistry {
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next_state;
-            if wait_result.timed_out() {
+            if wait_result.timed_out() && started.elapsed() >= self.inner.bind_wait {
                 return Err("ASKPASS 等待 SSH 进程绑定超时。".to_string());
             }
         }

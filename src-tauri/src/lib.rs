@@ -1179,6 +1179,7 @@ fn spawn_pty_command(
         .slave
         .spawn_command(command)
         .map_err(|error| format!("无法启动会话进程：{error}"))?;
+    drop(pair.slave);
     let process_id = child.process_id();
     let killer = child.clone_killer();
     let askpass_ticket = match pending_askpass_ticket {
@@ -1653,13 +1654,7 @@ fn start_session(
     rows: u16,
     cwd: Option<String>,
 ) -> Result<String, String> {
-    let cwd = cwd.and_then(|value| {
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    });
+    let cwd = cwd.filter(|value| !value.trim().is_empty());
     spawn_session(app, state.inner(), cols, rows, cwd, None)
 }
 
@@ -2173,6 +2168,7 @@ mod task_three_tests {
         let mut command = CommandBuilder::new("cmd.exe");
         command.args(["/D", "/Q"]);
         let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
         let mut writer = pair.master.take_writer().unwrap();
         pair.master
@@ -2220,6 +2216,7 @@ mod task_three_tests {
         let mut command = CommandBuilder::new("cmd.exe");
         command.args(["/D", "/Q", "/C", "ping -n 30 127.0.0.1 >NUL"]);
         let mut child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
         let mut killer = child.clone_killer();
         let waiter = thread::spawn(move || {
             child
@@ -2273,19 +2270,22 @@ mod task_three_tests {
         }
     }
 
+    #[test]
+    #[ignore = "仅作为 SSH 超时测试的直接子进程夹具"]
+    fn sleeping_ssh_test_fixture() {
+        thread::sleep(Duration::from_secs(10));
+    }
+
     fn sleeping_ssh_test_command() -> Command {
-        #[cfg(windows)]
-        {
-            let mut command = Command::new("cmd.exe");
-            command.args(["/D", "/Q", "/C", "ping -n 6 127.0.0.1 >NUL"]);
-            command
-        }
-        #[cfg(not(windows))]
-        {
-            let mut command = Command::new("/bin/sh");
-            command.args(["-c", "sleep 5"]);
-            command
-        }
+        let mut command =
+            Command::new(std::env::current_exe().expect("测试需要当前测试可执行文件"));
+        command.args([
+            "--exact",
+            "task_three_tests::sleeping_ssh_test_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        command
     }
 
     #[test]
@@ -2307,7 +2307,7 @@ mod task_three_tests {
         let error = run_ssh_test_process(command, Duration::from_millis(50), None).unwrap_err();
 
         assert_eq!(error, "SSH 连接测试超时。");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     #[test]

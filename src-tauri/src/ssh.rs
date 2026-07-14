@@ -457,7 +457,7 @@ mod tests {
         validate_profile_for_connection, CredentialStore, CredentialUpdate, ProfileRepository,
         SshAuthType, SshProfile, SSH_ERROR_LIMIT_CHARS,
     };
-    use crate::platform::PlatformKind;
+    use crate::platform::{self, PlatformKind};
     use std::{
         cell::{Cell, RefCell},
         collections::HashMap,
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn expands_home_prefix_for_key_identity() {
-        let home = PathBuf::from(std::env::var_os("HOME").expect("测试需要 HOME"));
+        let home = platform::user_home().expect("测试需要用户主目录");
         let file_name = format!(
             ".terminal-codex-ssh-key-test-{}-{}",
             std::process::id(),

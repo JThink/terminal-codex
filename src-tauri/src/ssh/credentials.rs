@@ -416,7 +416,7 @@ fn hex_decode_exact(value: &str, len: usize) -> Result<Vec<u8>, String> {
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err("SSH 本地凭据库编码无效。".to_string());
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);

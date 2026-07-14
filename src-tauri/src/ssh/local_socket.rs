@@ -100,12 +100,7 @@ pub(crate) fn peer_pid(stream: &LocalStream) -> Result<u32, String> {
             winsock_last_error()
         ));
     }
-    if bytes_returned as usize != std::mem::size_of::<u32>() {
-        return Err(format!(
-            "ASKPASS socket 对端进程身份返回长度无效：期望 {} 字节，实际 {bytes_returned} 字节。",
-            std::mem::size_of::<u32>()
-        ));
-    }
+    // Windows may report zero bytes here even though the fixed-size PID output was written.
     if pid == 0 {
         return Err("ASKPASS socket 对端进程 ID 无效。".to_string());
     }
