@@ -32,4 +32,10 @@ aes-gcm = "0.10"
 getrandom = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+uds_windows = "1.1"
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+] }

@@ -3,6 +3,7 @@ use super::{
         read_frame, write_frame, ASKPASS_FAILURE, ASKPASS_IO_TIMEOUT, ASKPASS_MAX_RESPONSE_BYTES,
         ASKPASS_SUCCESS,
     },
+    local_socket::{self, LocalStream},
     ASKPASS_MARKER_ENV, ASKPASS_SOCKET_ENV, ASKPASS_TOKEN_ENV,
 };
 #[cfg(test)]
@@ -11,7 +12,6 @@ use std::{
     env,
     ffi::OsString,
     io::{self, Write},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
@@ -54,8 +54,8 @@ pub(super) fn request_password(
     capability_token: &str,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     validate_capability_token(capability_token)?;
-    let mut stream =
-        UnixStream::connect(socket_path).map_err(|_| "无法连接 ASKPASS broker。".to_string())?;
+    let mut stream: LocalStream =
+        local_socket::connect(socket_path).map_err(|_| "无法连接 ASKPASS broker。".to_string())?;
     stream
         .set_read_timeout(Some(ASKPASS_IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(ASKPASS_IO_TIMEOUT)))
@@ -166,17 +166,15 @@ pub(crate) fn ssh_askpass_exit_code_if_requested() -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        collect_askpass_request, request_password, ssh_askpass_client_exit_code_with,
-        ssh_askpass_client_exit_code_with_os_environment,
-    };
-    use crate::ssh::{ASKPASS_MARKER_ENV, ASKPASS_SOCKET_ENV, ASKPASS_TOKEN_ENV};
+    #[cfg(unix)]
+    use super::ssh_askpass_client_exit_code_with_os_environment;
+    use super::{collect_askpass_request, request_password, ssh_askpass_client_exit_code_with};
+    use crate::ssh::{local_socket, ASKPASS_MARKER_ENV, ASKPASS_SOCKET_ENV, ASKPASS_TOKEN_ENV};
     use std::{
         collections::BTreeMap,
         ffi::OsString,
         fs,
         io::{Read, Write},
-        os::unix::{ffi::OsStringExt, net::UnixListener},
         path::PathBuf,
         thread,
         time::Duration,
@@ -200,7 +198,7 @@ mod tests {
             ));
             fs::create_dir(&directory).unwrap();
             let socket = directory.join("s");
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = local_socket::bind(&socket).unwrap();
             let worker = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
@@ -291,8 +289,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_internal_environment_fails_before_tauri_startup() {
+        use std::os::unix::ffi::OsStringExt;
+
         let invalid = OsString::from_vec(vec![0xff]);
         for invalid_key in [ASKPASS_MARKER_ENV, ASKPASS_SOCKET_ENV, ASKPASS_TOKEN_ENV] {
             let mut stdout = Vec::new();

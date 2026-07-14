@@ -1,5 +1,6 @@
 use super::{
     credentials::{endpoint_fingerprint, LaunchCredentialSnapshot},
+    local_socket::{self, LocalListener, LocalStream},
     process::AskpassLaunchEnv,
 };
 use sha2::{Digest, Sha256};
@@ -7,8 +8,6 @@ use std::{
     collections::HashMap,
     fmt, fs,
     io::{self, Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
-    os::unix::{ffi::OsStrExt, fs::DirBuilderExt, fs::PermissionsExt},
     panic::{self, AssertUnwindSafe},
     path::Path,
     path::PathBuf,
@@ -637,7 +636,7 @@ impl AskpassRegistry {
             .len()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn token_lookup_count(&self) -> usize {
         self.inner
             .token_lookups
@@ -876,17 +875,17 @@ impl BrokerRuntimeHealth {
 }
 
 trait ConnectionAcceptor: Send + Sync {
-    fn accept_connection(&self) -> io::Result<UnixStream>;
+    fn accept_connection(&self) -> io::Result<LocalStream>;
 }
 
-impl ConnectionAcceptor for UnixListener {
-    fn accept_connection(&self) -> io::Result<UnixStream> {
+impl ConnectionAcceptor for LocalListener {
+    fn accept_connection(&self) -> io::Result<LocalStream> {
         self.accept().map(|(stream, _)| stream)
     }
 }
 
 impl AskpassBroker {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn start() -> Result<Self, String> {
         Self::start_with_failure_callback(|_| {})
     }
@@ -911,18 +910,25 @@ impl AskpassBroker {
     ) -> Result<Self, String> {
         let directory = create_private_socket_directory()?;
         let socket_path = directory.join("s");
-        if socket_path.as_os_str().as_bytes().len() > ASKPASS_SOCKET_PATH_LIMIT {
+        let socket_path_length = match local_socket::socket_path_len(&socket_path) {
+            Ok(length) => length,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&directory);
+                return Err(format!("ASKPASS broker socket 路径无效：{error}"));
+            }
+        };
+        if socket_path_length > ASKPASS_SOCKET_PATH_LIMIT {
             let _ = fs::remove_dir_all(&directory);
             return Err("ASKPASS broker socket 路径超出系统限制。".to_string());
         }
-        let listener = match UnixListener::bind(&socket_path) {
+        let listener = match local_socket::bind(&socket_path) {
             Ok(listener) => listener,
             Err(error) => {
                 let _ = fs::remove_dir_all(&directory);
                 return Err(format!("无法创建 ASKPASS broker socket：{error}"));
             }
         };
-        if let Err(error) = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)) {
+        if let Err(error) = set_private_socket_permissions(&socket_path) {
             drop(listener);
             let _ = fs::remove_dir_all(&directory);
             return Err(format!("无法设置 ASKPASS broker socket 权限：{error}"));
@@ -1043,32 +1049,64 @@ impl Drop for AskpassBroker {
     }
 }
 
-fn create_private_socket_directory() -> Result<PathBuf, String> {
+#[cfg(unix)]
+fn set_private_socket_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(windows)]
+fn set_private_socket_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn socket_directory_bases() -> Vec<PathBuf> {
     let mut bases = vec![std::env::temp_dir()];
     if bases.first().map(PathBuf::as_path) != Some(Path::new("/tmp")) {
         bases.push(PathBuf::from("/tmp"));
     }
-    for base in bases {
+    bases
+}
+
+#[cfg(windows)]
+fn socket_directory_bases() -> Vec<PathBuf> {
+    vec![std::env::temp_dir()]
+}
+
+#[cfg(unix)]
+fn create_socket_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(windows)]
+fn create_socket_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+fn create_private_socket_directory() -> Result<PathBuf, String> {
+    for base in socket_directory_bases() {
         for _ in 0..32 {
             let random = uuid::Uuid::new_v4().simple().to_string();
             let directory = base.join(format!("lcs-{}", &random[..16]));
-            if directory.join("s").as_os_str().as_bytes().len() > ASKPASS_SOCKET_PATH_LIMIT {
+            let socket_path = directory.join("s");
+            if local_socket::socket_path_len(&socket_path)
+                .map(|length| length > ASKPASS_SOCKET_PATH_LIMIT)
+                .unwrap_or(true)
+            {
                 break;
             }
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            match builder.create(&directory) {
-                Ok(()) => {
-                    if let Err(error) =
-                        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-                    {
-                        let _ = fs::remove_dir_all(&directory);
-                        return Err(format!("无法设置 ASKPASS broker 目录权限：{error}"));
-                    }
-                    return Ok(directory);
-                }
+            match create_socket_directory(&directory) {
+                Ok(()) => return Ok(directory),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
+                    let _ = fs::remove_dir_all(&directory);
                     return Err(format!("无法创建 ASKPASS broker 临时目录：{error}"));
                 }
             }
@@ -1085,16 +1123,27 @@ enum AcceptErrorClass {
     Fatal,
 }
 
+#[cfg(unix)]
+fn is_accept_resource_pressure(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| matches!(code, libc::EMFILE | libc::ENFILE | libc::ENOMEM))
+}
+
+#[cfg(windows)]
+fn is_accept_resource_pressure(error: &io::Error) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{WSAEMFILE, WSAENOBUFS, WSA_NOT_ENOUGH_MEMORY};
+
+    error
+        .raw_os_error()
+        .is_some_and(|code| matches!(code, WSAEMFILE | WSAENOBUFS | WSA_NOT_ENOUGH_MEMORY))
+}
+
 fn classify_accept_error(error: &io::Error) -> AcceptErrorClass {
     match error.kind() {
         io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => AcceptErrorClass::Continue,
         io::ErrorKind::WouldBlock => AcceptErrorClass::Poll,
-        _ if error
-            .raw_os_error()
-            .is_some_and(|code| matches!(code, libc::EMFILE | libc::ENFILE | libc::ENOMEM)) =>
-        {
-            AcceptErrorClass::ResourcePressure
-        }
+        _ if is_accept_resource_pressure(error) => AcceptErrorClass::ResourcePressure,
         _ => AcceptErrorClass::Fatal,
     }
 }
@@ -1103,7 +1152,7 @@ fn run_accept_server(
     acceptor: Arc<dyn ConnectionAcceptor>,
     registry: AskpassRegistry,
     shutdown: Arc<AtomicBool>,
-    connection_sender: std::sync::mpsc::SyncSender<UnixStream>,
+    connection_sender: std::sync::mpsc::SyncSender<LocalStream>,
     health: BrokerRuntimeHealth,
 ) {
     let server_registry = registry.clone();
@@ -1137,7 +1186,7 @@ fn serve_accept_loop(
     acceptor: Arc<dyn ConnectionAcceptor>,
     registry: AskpassRegistry,
     shutdown: Arc<AtomicBool>,
-    connection_sender: std::sync::mpsc::SyncSender<UnixStream>,
+    connection_sender: std::sync::mpsc::SyncSender<LocalStream>,
     health: BrokerRuntimeHealth,
 ) {
     let mut resource_backoff = ASKPASS_ACCEPT_POLL_INTERVAL;
@@ -1183,7 +1232,7 @@ fn serve_accept_loop(
 }
 
 fn run_connection_worker(
-    connection_receiver: Arc<Mutex<std::sync::mpsc::Receiver<UnixStream>>>,
+    connection_receiver: Arc<Mutex<std::sync::mpsc::Receiver<LocalStream>>>,
     registry: AskpassRegistry,
     shutdown: Arc<AtomicBool>,
     health: BrokerRuntimeHealth,
@@ -1209,7 +1258,7 @@ fn run_connection_worker(
 }
 
 fn serve_connections(
-    connection_receiver: Arc<Mutex<std::sync::mpsc::Receiver<UnixStream>>>,
+    connection_receiver: Arc<Mutex<std::sync::mpsc::Receiver<LocalStream>>>,
     registry: AskpassRegistry,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -1237,8 +1286,8 @@ fn serve_connections(
     }
 }
 
-fn handle_connection(stream: &mut UnixStream, registry: &AskpassRegistry) -> Result<(), String> {
-    let helper_pid = peer_pid(stream)?;
+fn handle_connection(stream: &mut LocalStream, registry: &AskpassRegistry) -> Result<(), String> {
+    let helper_pid = local_socket::peer_pid(stream)?;
     let peer = registry.capture_peer_identity(helper_pid)?;
     let token = read_frame(stream, ASKPASS_MAX_REQUEST_BYTES)
         .map_err(|_| "ASKPASS 请求协议无效。".to_string())?;
@@ -1279,52 +1328,26 @@ pub(super) fn write_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result
     writer.flush()
 }
 
-#[cfg(target_os = "macos")]
-fn peer_pid(stream: &UnixStream) -> Result<u32, String> {
-    use std::os::fd::AsRawFd;
-
-    let mut pid: libc::pid_t = 0;
-    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&mut pid as *mut libc::pid_t).cast(),
-            &mut length,
-        )
-    };
-    if result != 0 || length as usize != std::mem::size_of::<libc::pid_t>() || pid <= 0 {
-        return Err("无法获取 ASKPASS socket 对端进程身份。".to_string());
-    }
-    u32::try_from(pid).map_err(|_| "ASKPASS socket 对端进程 ID 无效。".to_string())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn peer_pid(_stream: &UnixStream) -> Result<u32, String> {
-    Err("当前平台不支持 macOS LOCAL_PEERPID 校验。".to_string())
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::{handle_connection, write_frame, ASKPASS_IO_TIMEOUT, ASKPASS_SOCKET_PATH_LIMIT};
     use super::{
-        handle_connection, peer_pid, read_frame, run_accept_server, write_frame, AskpassBroker,
-        AskpassRegistry, BrokerRuntimeHealth, ConnectionAcceptor, PeerIdentitySnapshot,
-        ProcessFacts, ProcessIdentityVerifier, ProcessInspector, RegistryClock, SshBinding,
-        ASKPASS_BIND_WAIT, ASKPASS_IO_TIMEOUT, ASKPASS_MAX_REQUEST_BYTES,
-        ASKPASS_SOCKET_PATH_LIMIT, ASKPASS_TICKET_TTL,
+        read_frame, run_accept_server, AskpassBroker, AskpassRegistry, BrokerRuntimeHealth,
+        ConnectionAcceptor, PeerIdentitySnapshot, ProcessFacts, ProcessIdentityVerifier,
+        ProcessInspector, RegistryClock, SshBinding, ASKPASS_BIND_WAIT, ASKPASS_MAX_REQUEST_BYTES,
+        ASKPASS_TICKET_TTL,
     };
     use crate::ssh::{
         credential_snapshot_for_launch,
         credentials::{endpoint_fingerprint, LaunchCredentialSnapshot},
+        local_socket::{self, LocalStream},
         process::{ASKPASS_SOCKET_ENV, ASKPASS_TOKEN_ENV},
         upsert_profile_with_credential, CredentialStore, CredentialUpdate, SshAuthType, SshProfile,
     };
     use std::{
         collections::{HashMap, VecDeque},
         io::{self, Cursor, Write},
-        os::unix::net::{UnixListener, UnixStream},
-        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
@@ -1475,8 +1498,10 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     struct CurrentHelperIdentityVerifier;
 
+    #[cfg(target_os = "macos")]
     impl super::IdentityVerifier for CurrentHelperIdentityVerifier {
         fn capture_peer(&self, helper_pid: u32) -> Result<PeerIdentitySnapshot, String> {
             if helper_pid != std::process::id() {
@@ -1509,10 +1534,12 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     struct RejectingPeerIdentityVerifier {
         capture_calls: AtomicUsize,
     }
 
+    #[cfg(target_os = "macos")]
     impl super::IdentityVerifier for RejectingPeerIdentityVerifier {
         fn capture_peer(&self, _helper_pid: u32) -> Result<PeerIdentitySnapshot, String> {
             self.capture_calls.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1560,7 +1587,7 @@ mod tests {
     }
 
     impl ConnectionAcceptor for ScriptedAcceptor {
-        fn accept_connection(&self) -> io::Result<UnixStream> {
+        fn accept_connection(&self) -> io::Result<LocalStream> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             match self.steps.lock().unwrap().pop_front().unwrap() {
                 ScriptedAcceptStep::Error(error) => Err(error),
@@ -1571,6 +1598,26 @@ mod tests {
                 ScriptedAcceptStep::Panic => panic!("scripted accept panic"),
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn resource_pressure_errors() -> Vec<io::Error> {
+        [libc::EMFILE, libc::ENFILE, libc::ENOMEM]
+            .into_iter()
+            .map(io::Error::from_raw_os_error)
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn resource_pressure_errors() -> Vec<io::Error> {
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAEMFILE, WSAENOBUFS, WSA_NOT_ENOUGH_MEMORY,
+        };
+
+        [WSAEMFILE, WSAENOBUFS, WSA_NOT_ENOUGH_MEMORY]
+            .into_iter()
+            .map(io::Error::from_raw_os_error)
+            .collect()
     }
 
     #[derive(Default)]
@@ -1781,7 +1828,7 @@ mod tests {
             ASKPASS_TICKET_TTL,
             Duration::from_secs(1),
         );
-        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = LocalStream::pair().unwrap();
         let nonexistent_token = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         write_frame(&mut client, nonexistent_token.as_bytes()).unwrap();
 
@@ -1843,7 +1890,7 @@ mod tests {
             ASKPASS_TICKET_TTL,
             ASKPASS_BIND_WAIT,
         );
-        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = LocalStream::pair().unwrap();
         let token = b"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         write_frame(&mut client, token).unwrap();
 
@@ -2184,18 +2231,19 @@ mod tests {
     #[test]
     fn transient_accept_errors_continue_with_bounded_resource_backoff() {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let acceptor = Arc::new(ScriptedAcceptor::new(
-            vec![
-                ScriptedAcceptStep::Error(io::Error::from(io::ErrorKind::Interrupted)),
-                ScriptedAcceptStep::Error(io::Error::from(io::ErrorKind::ConnectionAborted)),
-                ScriptedAcceptStep::Error(io::Error::from(io::ErrorKind::WouldBlock)),
-                ScriptedAcceptStep::Error(io::Error::from_raw_os_error(libc::EMFILE)),
-                ScriptedAcceptStep::Error(io::Error::from_raw_os_error(libc::ENFILE)),
-                ScriptedAcceptStep::Error(io::Error::from_raw_os_error(libc::ENOMEM)),
-                ScriptedAcceptStep::Stop,
-            ],
-            Arc::clone(&shutdown),
-        ));
+        let mut steps = vec![
+            ScriptedAcceptStep::Error(io::Error::from(io::ErrorKind::Interrupted)),
+            ScriptedAcceptStep::Error(io::Error::from(io::ErrorKind::ConnectionAborted)),
+            ScriptedAcceptStep::Error(io::Error::from(io::ErrorKind::WouldBlock)),
+        ];
+        steps.extend(
+            resource_pressure_errors()
+                .into_iter()
+                .map(ScriptedAcceptStep::Error),
+        );
+        steps.push(ScriptedAcceptStep::Stop);
+        let expected_calls = steps.len();
+        let acceptor = Arc::new(ScriptedAcceptor::new(steps, Arc::clone(&shutdown)));
         let registry = registry(Arc::new(FakeClock::new()), ASKPASS_BIND_WAIT);
         let health = BrokerRuntimeHealth::new(Arc::new(|_| {}));
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -2208,7 +2256,7 @@ mod tests {
             health.clone(),
         );
 
-        assert_eq!(acceptor.calls.load(AtomicOrdering::SeqCst), 7);
+        assert_eq!(acceptor.calls.load(AtomicOrdering::SeqCst), expected_calls);
         assert!(health.ensure_healthy().is_ok());
         assert!(!registry.inner.state.lock().unwrap().shutdown);
         drop(receiver);
@@ -2568,15 +2616,18 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn broker_creates_private_short_directory_and_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
         let clock = Arc::new(FakeClock::new());
         let broker =
             AskpassBroker::start_with_registry(registry(clock, ASKPASS_BIND_WAIT)).unwrap();
         let socket_path = broker.socket_path();
         let directory = socket_path.parent().unwrap();
 
-        assert!(socket_path.as_os_str().as_bytes().len() <= ASKPASS_SOCKET_PATH_LIMIT);
+        assert!(local_socket::socket_path_len(socket_path).unwrap() <= ASKPASS_SOCKET_PATH_LIMIT);
         assert_eq!(
             std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
             0o700
@@ -2595,7 +2646,7 @@ mod tests {
         let directory = broker.socket_path().parent().unwrap().to_path_buf();
         let pending = registry.register(snapshot()).unwrap();
         let token = token_of(&pending);
-        let mut stalled = UnixStream::connect(broker.socket_path()).unwrap();
+        let mut stalled = local_socket::connect(broker.socket_path()).unwrap();
         stalled.write_all(&[0, 0]).unwrap();
         thread::sleep(Duration::from_millis(20));
         let started = Instant::now();
@@ -2645,21 +2696,22 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn local_peer_pid_reports_real_connecting_process() {
-        let directory = std::env::temp_dir().join(format!(
-            "lc-peer-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        #[cfg(target_os = "macos")]
+        let base = PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let base = std::env::temp_dir();
+        let random = uuid::Uuid::new_v4().simple().to_string();
+        let directory = base.join(format!("lcp-{}", &random[..16]));
         std::fs::create_dir(&directory).unwrap();
         let socket = directory.join("s");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let client = UnixStream::connect(&socket).unwrap();
+        let listener = local_socket::bind(&socket).unwrap();
+        let client = local_socket::connect(&socket).unwrap();
         let (server, _) = listener.accept().unwrap();
 
-        assert_eq!(peer_pid(&server).unwrap(), std::process::id());
+        assert_eq!(local_socket::peer_pid(&server).unwrap(), std::process::id());
 
         drop(client);
         drop(server);

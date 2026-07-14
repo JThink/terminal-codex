@@ -10,6 +10,7 @@ use std::{
 mod askpass;
 mod broker;
 mod credentials;
+mod local_socket;
 mod process;
 mod transaction;
 pub(crate) use askpass::ssh_askpass_exit_code_if_requested;

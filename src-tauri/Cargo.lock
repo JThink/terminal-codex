@@ -1922,6 +1922,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "uds_windows",
  "uuid",
  "windows-sys 0.60.2",
  "zeroize",
