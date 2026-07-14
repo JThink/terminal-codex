@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as sshConnectionHelpers from "./ssh-connections.mjs";
 
 import {
@@ -43,6 +46,9 @@ const profiles = [
     authType: "key",
   },
 ];
+
+const srcDir = dirname(fileURLToPath(import.meta.url));
+const readSource = (fileName) => readFileSync(join(srcDir, fileName), "utf8");
 
 test("filters SSH profiles by name, host, username, and endpoint", () => {
   assert.deepEqual(filterSshProfiles(profiles, "PRODUCTION"), [profiles[0]]);
@@ -108,6 +114,61 @@ test("launcher enter target uses the active match or falls back to the first one
 test("launcher can select add action when there are no profile matches", () => {
   assert.equal(getSshLauncherActiveProfileId([], ""), getSshLauncherAddActionId());
   assert.equal(isSshLauncherAddActionId(getSshLauncherActiveProfileId([], "")), true);
+});
+
+test("launcher key actions select profiles cyclically and enter opens the active target", () => {
+  const resolveKeyAction = sshConnectionHelpers.resolveSshLauncherKeyAction;
+  assert.equal(typeof resolveKeyAction, "function");
+
+  const visibleProfiles = getSshLauncherProfiles(profiles, "", ["two", "one"]);
+  assert.deepEqual(resolveKeyAction(visibleProfiles, "two", "ArrowDown"), {
+    kind: "select",
+    activeProfileId: "one",
+    profile: null,
+  });
+  assert.deepEqual(resolveKeyAction(visibleProfiles, "two", "ArrowUp"), {
+    kind: "select",
+    activeProfileId: getSshLauncherAddActionId(),
+    profile: null,
+  });
+  assert.deepEqual(resolveKeyAction(visibleProfiles, getSshLauncherAddActionId(), "Enter"), {
+    kind: "add",
+    activeProfileId: getSshLauncherAddActionId(),
+    profile: null,
+  });
+  assert.deepEqual(resolveKeyAction(visibleProfiles, "one", "Enter"), {
+    kind: "connect",
+    activeProfileId: "one",
+    profile: profiles[0],
+  });
+});
+
+test("SSH launcher keyboard handling is not limited to the search input", () => {
+  const mainSource = readSource("main.js");
+  assert.equal(
+    /document\.addEventListener\(\s*"keydown",\s*handleSshConnectionsLauncherKeyDown/.test(
+      mainSource
+    ),
+    true
+  );
+  assert.equal(
+    /sshConnectionsSearchInput\.addEventListener\("keydown"/.test(mainSource),
+    false
+  );
+});
+
+test("SSH delete action does not depend on native confirmation dialogs", () => {
+  const mainSource = readSource("main.js");
+  const deleteSource =
+    /const deleteCurrentSshProfile = async \(\) => \{[\s\S]*?\n\};/.exec(mainSource)?.[0] ||
+    "";
+  assert.notEqual(deleteSource, "");
+  assert.equal(deleteSource.includes("window.confirm"), false);
+});
+
+test("recent add row exposes the same active visual state as profile rows", () => {
+  const styles = readSource("styles.css");
+  assert.equal(/\.ssh-connections-add-row\.active\b/.test(styles), true);
 });
 
 test("removes a deleted SSH profile from the loaded list", () => {

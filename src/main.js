@@ -4,16 +4,14 @@ import {
   cloneLaunchSpec,
   filterSshProfiles,
   formatSshEndpoint,
-  getSshLauncherAddActionId,
   getSshLauncherActiveProfileId,
   getSshLauncherProfiles,
-  getSshLauncherTargetProfile,
   isSshLauncherAddActionId,
-  moveSshLauncherActiveProfileId,
   normalizeLaunchSpec,
   normalizeRecentProfileIds,
   pushRecentProfileId,
   removeSshProfileById,
+  resolveSshLauncherKeyAction,
   resolveSshLaunchProfile,
   serializeLaunchSpec,
   terminalBytes,
@@ -1052,10 +1050,6 @@ const deleteCurrentSshProfile = async () => {
   if (!selectedSshProfileId || sshConnectionOperationInFlight) {
     return;
   }
-  const profile = sshProfiles.find((candidate) => candidate.id === selectedSshProfileId);
-  if (!window.confirm(`确认删除“${profile?.name || "此连接"}”？`)) {
-    return;
-  }
   const profileId = selectedSshProfileId;
   const operationGeneration = beginSshConnectionOperation();
   if (operationGeneration == null) {
@@ -1091,44 +1085,64 @@ sshConnectionsSearchInput.addEventListener("input", () => {
   }
   renderSshConnectionsList();
 });
-sshConnectionsSearchInput.addEventListener("keydown", (event) => {
-  if (sshConnectionsView !== "recent" || sshConnectionOperationInFlight) {
+const shouldHandleSshConnectionsLauncherKeyDown = (event) => {
+  if (
+    !isSshConnectionsVisible() ||
+    sshConnectionsView !== "recent" ||
+    sshConnectionOperationInFlight ||
+    event.defaultPrevented ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.altKey
+  ) {
+    return false;
+  }
+  if (
+    event.key !== "ArrowDown" &&
+    event.key !== "ArrowUp" &&
+    event.key !== "Enter"
+  ) {
+    return false;
+  }
+  if (event.key !== "Enter") {
+    return true;
+  }
+  if (!(event.target instanceof Element)) {
+    return true;
+  }
+  return !event.target.closest(
+    ".ssh-connections-row-edit, .ssh-connections-icon-button"
+  );
+};
+const handleSshConnectionsLauncherKeyDown = (event) => {
+  if (!shouldHandleSshConnectionsLauncherKeyDown(event)) {
     return;
   }
   const visibleProfiles = getVisibleSshProfiles();
-  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-    event.preventDefault();
-    sshRecentActiveProfileId = moveSshLauncherActiveProfileId(
-      visibleProfiles,
-      sshRecentActiveProfileId,
-      event.key === "ArrowDown" ? 1 : -1
-    );
-    renderSshConnectionsList();
-    return;
-  }
-  if (event.key !== "Enter") {
+  const action = resolveSshLauncherKeyAction(
+    visibleProfiles,
+    sshRecentActiveProfileId,
+    event.key
+  );
+  if (action.kind === "ignore") {
     return;
   }
   event.preventDefault();
-  const activeProfileId = getSshLauncherActiveProfileId(
-    visibleProfiles,
-    sshRecentActiveProfileId
-  );
-  if (isSshLauncherAddActionId(activeProfileId)) {
-    sshRecentActiveProfileId = getSshLauncherAddActionId();
+  event.stopPropagation();
+  sshRecentActiveProfileId = action.activeProfileId;
+  if (action.kind === "select") {
+    renderSshConnectionsList();
+    return;
+  }
+  if (action.kind === "add") {
     openSshConnectionForm(null);
     return;
   }
-  const targetProfile = getSshLauncherTargetProfile(
-    visibleProfiles,
-    activeProfileId
-  );
-  if (!targetProfile) {
-    return;
+  if (action.kind === "connect" && action.profile) {
+    void connectSshProfile(action.profile);
   }
-  sshRecentActiveProfileId = targetProfile.id;
-  void connectSshProfile(targetProfile);
-});
+};
+document.addEventListener("keydown", handleSshConnectionsLauncherKeyDown);
 sshConnectionsBackButton.addEventListener("click", () =>
   showSshConnectionsRecentView({ resetSearch: true })
 );

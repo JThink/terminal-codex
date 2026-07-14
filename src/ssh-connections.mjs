@@ -205,6 +205,52 @@ export const getSshLauncherTargetProfile = (profiles, activeProfileId) => {
   );
 };
 
+export const resolveSshLauncherKeyAction = (profiles, activeProfileId, key) => {
+  const visibleProfiles = Array.isArray(profiles) ? profiles : [];
+  if (key === "ArrowDown" || key === "ArrowUp") {
+    return {
+      kind: "select",
+      activeProfileId: moveSshLauncherActiveProfileId(
+        visibleProfiles,
+        activeProfileId,
+        key === "ArrowDown" ? 1 : -1
+      ),
+      profile: null,
+    };
+  }
+  if (key !== "Enter") {
+    return {
+      kind: "ignore",
+      activeProfileId,
+      profile: null,
+    };
+  }
+
+  const resolvedActiveId = getSshLauncherActiveProfileId(
+    visibleProfiles,
+    activeProfileId
+  );
+  if (isSshLauncherAddActionId(resolvedActiveId)) {
+    return {
+      kind: "add",
+      activeProfileId: SSH_LAUNCHER_ADD_ACTION_ID,
+      profile: null,
+    };
+  }
+  const profile = getSshLauncherTargetProfile(visibleProfiles, resolvedActiveId);
+  return profile
+    ? {
+        kind: "connect",
+        activeProfileId: text(profile.id),
+        profile,
+      }
+    : {
+        kind: "ignore",
+        activeProfileId: resolvedActiveId,
+        profile: null,
+      };
+};
+
 export const normalizeLaunchSpec = (launchSpec, legacyCwd = null) => {
   if (launchSpec?.kind === "ssh") {
     return {

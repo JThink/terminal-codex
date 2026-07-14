@@ -784,6 +784,13 @@ body.window-dragging * {
   background: rgba(44, 61, 78, 0.82);
 }
 
+.ssh-connections-add-row.active,
+.ssh-connections-add-row:focus-visible {
+  border-color: rgba(92, 141, 191, 0.72);
+  background: #365670;
+  outline: none;
+}
+
 .ssh-connections-form-pane {
   min-width: 0;
   min-height: 0;
