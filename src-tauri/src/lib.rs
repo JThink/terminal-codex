@@ -2166,7 +2166,13 @@ mod task_three_tests {
             })
             .unwrap();
         let mut command = CommandBuilder::new("cmd.exe");
-        command.args(["/D", "/Q"]);
+        command.args([
+            "/D",
+            "/Q",
+            "/V:ON",
+            "/C",
+            "set /P \"line=\" & echo __TERMINAL_CODEX_CONPTY__!line! & exit /B 0",
+        ]);
         let mut child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -2186,9 +2192,7 @@ mod task_three_tests {
             let _ = output_sender.send(result);
         });
 
-        writer
-            .write_all(b"echo __TERMINAL_CODEX_CONPTY__\r\nexit\r\n")
-            .unwrap();
+        writer.write_all(b"round-trip\r\n").unwrap();
         writer.flush().unwrap();
         drop(writer);
         let status = child.wait().unwrap();
@@ -2198,8 +2202,12 @@ mod task_three_tests {
             .unwrap()
             .unwrap();
 
-        assert!(status.success());
-        assert!(String::from_utf8_lossy(&output).contains("__TERMINAL_CODEX_CONPTY__"));
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            status.success(),
+            "Windows ConPTY 测试进程退出失败：{status:?}，输出：{output}"
+        );
+        assert!(output.contains("__TERMINAL_CODEX_CONPTY__round-trip"));
     }
 
     #[cfg(windows)]
