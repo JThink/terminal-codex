@@ -36,7 +36,7 @@
 - `npm run check`：检查前端主脚本语法
 - `cargo test --locked`（在 `src-tauri/` 下）：运行 Rust 单元测试
 - `cargo clippy --locked --all-targets -- -D warnings`（在 `src-tauri/` 下）：严格 Rust 静态检查
-- `cargo check --locked --target x86_64-pc-windows-msvc --all-targets`（在 `src-tauri/` 下）：检查 Windows 条件编译
+- `PATH="$(brew --prefix llvm)/bin:$PATH" cargo check --locked --target x86_64-pc-windows-msvc --all-targets`（在 `src-tauri/` 下）：macOS 使用 Homebrew LLVM 检查 Windows 条件编译
 
 ## 编码风格与命名约定
 
@@ -95,7 +95,8 @@
 前端纯函数使用 Node 内置 `node:test`；Rust 测试位于对应模块的 `#[cfg(test)]` 中。
 涉及 Unix socket、AF_UNIX 或本机 SSH 的测试在受限沙箱中可能需要额外系统权限，不能把
 `Operation not permitted` 当作业务断言失败。macOS 本地的 Windows target 只能证明条件
-编译，Windows 原生 GitHub Actions 才能证明测试、Clippy 和 NSIS 打包。
+编译，并需要先安装 Homebrew LLVM；Windows 原生 GitHub Actions 才能证明测试、Clippy
+和 NSIS 打包。
 
 ## 提交与合并请求规范
 

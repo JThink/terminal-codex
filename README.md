@@ -83,8 +83,12 @@ cd src-tauri
 cargo fmt -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-cargo check --locked --target x86_64-pc-windows-msvc --all-targets
+PATH="$(brew --prefix llvm)/bin:$PATH" \
+  cargo check --locked --target x86_64-pc-windows-msvc --all-targets
 ```
+
+最后一项是在 macOS 上进行 Windows 条件编译检查，需要先执行 `brew install llvm`；
+Windows 原生环境不需要设置这段 PATH。
 
 GitHub Actions 在 macOS 与 Windows 原生 runner 上重复测试、Clippy 和打包，并上传
 `.app`、`.dmg` 与 NSIS `.exe`。Windows runner 是 Windows 运行和安装包兼容性的权威
