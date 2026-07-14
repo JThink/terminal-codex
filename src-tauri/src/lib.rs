@@ -13,6 +13,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+mod platform;
 mod ssh;
 
 pub fn ssh_askpass_exit_code_if_requested() -> Option<i32> {
